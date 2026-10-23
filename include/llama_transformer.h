@@ -73,7 +73,7 @@ public:
     std::size_t d_model() const { return W_q_.rows(); }
 
     // x: (seq_len, d_model) -> output: (seq_len, d_model)
-    Mat<T> forward(const Mat<T>& x) const {
+    Mat<T> forward(const Mat<T>& x, std::vector<std::thread>* threads = nullptr) const {
         if (x.cols() != d_model()) {
             throw std::invalid_argument("input cols must equal d_model");
         }
@@ -82,9 +82,9 @@ public:
         std::size_t n_groups = n_heads_ / n_kv_heads_;
 
         // Project
-        Mat<T> Q = x.matmul(W_q_); // (seq_len, n_heads * head_dim)
-        Mat<T> K = x.matmul(W_k_); // (seq_len, n_kv_heads * head_dim)
-        Mat<T> V = x.matmul(W_v_); // (seq_len, n_kv_heads * head_dim)
+        Mat<T> Q = x.matmul(W_q_, threads); // (seq_len, n_heads * head_dim)
+        Mat<T> K = x.matmul(W_k_, threads); // (seq_len, n_kv_heads * head_dim)
+        Mat<T> V = x.matmul(W_v_, threads); // (seq_len, n_kv_heads * head_dim)
 
         T scale = T{1} / std::sqrt(static_cast<T>(head_dim_));
 
@@ -105,7 +105,7 @@ public:
             apply_rope(K_h);
 
             // scores = Q_h @ K_h^T / sqrt(head_dim) -> (seq_len, seq_len)
-            Mat<T> scores = Q_h.matmul(K_h.transpose());
+            Mat<T> scores = Q_h.matmul(K_h.transpose(), threads);
             scores.scale(scale);
 
             // Causal mask: zero out future positions
@@ -115,14 +115,14 @@ public:
             scores.softmax_rows();
 
             // attn_out = scores @ V_h -> (seq_len, head_dim)
-            Mat<T> attn_out = scores.matmul(V_h);
+            Mat<T> attn_out = scores.matmul(V_h, threads);
 
             // Write into concat
             concat.set_cols(h * head_dim_, attn_out);
         }
 
         // Output projection: (seq_len, n_heads * head_dim) @ W_o -> (seq_len, d_model)
-        return concat.matmul(W_o_);
+        return concat.matmul(W_o_, threads);
     }
 
 private:
@@ -151,23 +151,44 @@ public:
     std::size_t d_model() const { return gamma_.cols(); }
 
     // x: (seq_len, d_model) -> (seq_len, d_model)
-    Mat<T> forward(const Mat<T>& x) const {
+    Mat<T> forward(const Mat<T>& x, std::vector<std::thread>* threads = nullptr) const {
         if (x.cols() != d_model()) {
             throw std::invalid_argument("RMSNorm: input cols must equal d_model");
         }
         std::size_t seq_len = x.rows();
         std::size_t d = d_model();
         Mat<T> result(seq_len, d);
-        for (std::size_t r = 0; r < seq_len; ++r) {
-            T sum_sq{0};
-            for (std::size_t c = 0; c < d; ++c) {
-                sum_sq += x(r, c) * x(r, c);
+
+        auto worker = [&](std::size_t r_start, std::size_t r_end) {
+            for (std::size_t r = r_start; r < r_end; ++r) {
+                T sum_sq{0};
+                for (std::size_t c = 0; c < d; ++c) {
+                    sum_sq += x(r, c) * x(r, c);
+                }
+                T rms = std::sqrt(sum_sq / static_cast<T>(d) + eps_);
+                for (std::size_t c = 0; c < d; ++c) {
+                    result(r, c) = (x(r, c) / rms) * gamma_(0, c);
+                }
             }
-            T rms = std::sqrt(sum_sq / static_cast<T>(d) + eps_);
-            for (std::size_t c = 0; c < d; ++c) {
-                result(r, c) = (x(r, c) / rms) * gamma_(0, c);
+        };
+
+        constexpr std::size_t NUM_THREADS = 30;
+        if (threads && seq_len > 1) {
+            threads->clear();
+            const std::size_t rows_per_thread = (seq_len + NUM_THREADS - 1) / NUM_THREADS;
+            for (std::size_t t = 0; t < NUM_THREADS; ++t) {
+                const std::size_t r_start = t * rows_per_thread;
+                const std::size_t r_end = std::min(r_start + rows_per_thread, seq_len);
+                if (r_start >= seq_len) break;
+                threads->emplace_back(worker, r_start, r_end);
             }
+            for (auto& th : *threads) {
+                th.join();
+            }
+        } else {
+            worker(0, seq_len);
         }
+
         return result;
     }
 
@@ -200,12 +221,12 @@ public:
     std::size_t d_ff() const { return W_gate_.cols(); }
 
     // x: (seq_len, d_model) -> (seq_len, d_model)
-    Mat<T> forward(const Mat<T>& x) const {
+    Mat<T> forward(const Mat<T>& x, std::vector<std::thread>* threads = nullptr) const {
         if (x.cols() != d_model()) {
             throw std::invalid_argument("SwiGLU: input cols must equal d_model");
         }
-        Mat<T> gate = x.matmul(W_gate_);  // (seq_len, d_ff)
-        Mat<T> up = x.matmul(W_up_);      // (seq_len, d_ff)
+        Mat<T> gate = x.matmul(W_gate_, threads);  // (seq_len, d_ff)
+        Mat<T> up = x.matmul(W_up_, threads);      // (seq_len, d_ff)
 
         // silu(gate) ⊙ up
         Mat<T> activated = gate.apply([](T z) {
@@ -213,7 +234,7 @@ public:
         });
         Mat<T> fused = activated.hadamard(up);
 
-        return fused.matmul(W_down_);  // (seq_len, d_model)
+        return fused.matmul(W_down_, threads);  // (seq_len, d_model)
     }
 
 private:
@@ -231,12 +252,14 @@ public:
     LlamaBlock(RMSNorm<T> attn_norm, GQA<T> attn,
                RMSNorm<T> ffn_norm, SwiGLU<T> mlp)
         : attn_norm_{std::move(attn_norm)}, attn_{std::move(attn)},
-          ffn_norm_{std::move(ffn_norm)}, mlp_{std::move(mlp)} {}
+          ffn_norm_{std::move(ffn_norm)}, mlp_{std::move(mlp)} {
+        threads_.reserve(30);
+    }
 
     // x: (seq_len, d_model) -> (seq_len, d_model)
-    Mat<T> forward(const Mat<T>& x) const {
-        Mat<T> h = x.add(attn_.forward(attn_norm_.forward(x)));
-        return h.add(mlp_.forward(ffn_norm_.forward(h)));
+    Mat<T> forward(const Mat<T>& x) {
+        Mat<T> h = x.add(attn_.forward(attn_norm_.forward(x, &threads_), &threads_));
+        return h.add(mlp_.forward(ffn_norm_.forward(h, &threads_), &threads_));
     }
 
 private:
@@ -244,4 +267,5 @@ private:
     GQA<T> attn_;
     RMSNorm<T> ffn_norm_;
     SwiGLU<T> mlp_;
+    std::vector<std::thread> threads_;
 };

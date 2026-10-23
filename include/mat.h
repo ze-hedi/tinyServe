@@ -69,7 +69,7 @@ public:
     }
 
     // A(m, k) * B(k, n) -> C(m, n)  — 3D tiled for cache locality
-    Mat matmul(const Mat& B) const {
+    Mat matmul(const Mat& B, std::vector<std::thread>* threads = nullptr) const {
         if (cols_ != B.rows_) {
             throw std::invalid_argument("matmul: dimension mismatch");
         }
@@ -103,16 +103,29 @@ public:
         };
 
         const std::size_t rows_per_thread = (M + NUM_THREADS - 1) / NUM_THREADS;
-        std::vector<std::thread> threads;
-        threads.reserve(NUM_THREADS);
-        for (std::size_t t = 0; t < NUM_THREADS; ++t) {
-            const std::size_t row_start = t * rows_per_thread;
-            const std::size_t row_end = std::min(row_start + rows_per_thread, M);
-            if (row_start >= M) break;
-            threads.emplace_back(worker, row_start, row_end);
-        }
-        for (auto& th : threads) {
-            th.join();
+        if (threads) {
+            threads->clear();
+            for (std::size_t t = 0; t < NUM_THREADS; ++t) {
+                const std::size_t row_start = t * rows_per_thread;
+                const std::size_t row_end = std::min(row_start + rows_per_thread, M);
+                if (row_start >= M) break;
+                threads->emplace_back(worker, row_start, row_end);
+            }
+            for (auto& th : *threads) {
+                th.join();
+            }
+        } else {
+            std::vector<std::thread> local_threads;
+            local_threads.reserve(NUM_THREADS);
+            for (std::size_t t = 0; t < NUM_THREADS; ++t) {
+                const std::size_t row_start = t * rows_per_thread;
+                const std::size_t row_end = std::min(row_start + rows_per_thread, M);
+                if (row_start >= M) break;
+                local_threads.emplace_back(worker, row_start, row_end);
+            }
+            for (auto& th : local_threads) {
+                th.join();
+            }
         }
         return result;
     }

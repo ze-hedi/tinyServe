@@ -23,7 +23,7 @@ int main() {
     constexpr std::size_t n_kv_heads = 4;
     constexpr std::size_t head_dim  = d_model / n_heads; // 64
     constexpr std::size_t d_ff      = 1376; // ≈ 8/3 * d_model, rounded to even
-    constexpr std::size_t seq_len   = 500;
+    constexpr std::size_t seq_len   = 4000;
 
     std::mt19937 rng(42);
 
