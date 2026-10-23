@@ -52,18 +52,64 @@ public:
         return result;
     }
 
-    // Micro-kernel: C[i0..i_end, j0..j_end] += A[.., k0..k_end] * B[k0..k_end, ..]
-    __attribute__((always_inline)) static inline void matmul_tile(const T* A, const T* B, T* C, std::size_t K, std::size_t N,
+    // Register-tiled micro-kernel: MR×NR tile of C pinned in local variables
+    // C[mr×nr] += A[mr×K_len] * B[K_len×nr]
+    // Local vars → compiler maps them to registers, loaded once, stored once
+    __attribute__((always_inline))
+    static inline void micro_kernel(
+            const T* A_ptr, const T* B_ptr, T* C_ptr,
+            std::size_t mr, std::size_t nr, std::size_t K_len,
+            std::size_t lda, std::size_t ldb, std::size_t ldc) {
+        // Pin C tile in local accumulators (up to 6×16 = 96 values)
+        // Compiler will use registers for these
+        constexpr std::size_t MR = 6;
+        constexpr std::size_t NR = 16;
+        T acc[MR][NR] = {};
+
+        // Load existing C into accumulators
+        for (std::size_t i = 0; i < mr; ++i) {
+            for (std::size_t j = 0; j < nr; ++j) {
+                acc[i][j] = C_ptr[i * ldc + j];
+            }
+        }
+
+        // Accumulate A * B into registers — C never touched until the end
+        for (std::size_t k = 0; k < K_len; ++k) {
+            for (std::size_t i = 0; i < mr; ++i) {
+                const T a = A_ptr[i * lda + k];
+                for (std::size_t j = 0; j < nr; ++j) {
+                    acc[i][j] += a * B_ptr[k * ldb + j];
+                }
+            }
+        }
+
+        // Store accumulators back to C (once!)
+        for (std::size_t i = 0; i < mr; ++i) {
+            for (std::size_t j = 0; j < nr; ++j) {
+                C_ptr[i * ldc + j] = acc[i][j];
+            }
+        }
+    }
+
+    // Cache tile dispatcher: tiles down to MR×NR micro-kernels
+    __attribute__((always_inline))
+    static inline void matmul_tile(const T* A, const T* B, T* C,
+                            std::size_t K, std::size_t N,
                             std::size_t i0, std::size_t i_end, std::size_t j0,
                             std::size_t j_end, std::size_t k0, std::size_t k_end) {
-        for (std::size_t i = i0; i < i_end; ++i) {
-            for (std::size_t k = k0; k < k_end; ++k) {
-                const T a = A[i * K + k];
-                const std::size_t b_row = k * N;
-                const std::size_t c_row = i * N;
-                for (std::size_t j = j0; j < j_end; ++j) {
-                    C[c_row + j] += a * B[b_row + j];
-                }
+        constexpr std::size_t MR = 6;
+        constexpr std::size_t NR = 16;
+        const std::size_t K_len = k_end - k0;
+
+        for (std::size_t i = i0; i < i_end; i += MR) {
+            const std::size_t mr = std::min(MR, i_end - i);
+            for (std::size_t j = j0; j < j_end; j += NR) {
+                const std::size_t nr = std::min(NR, j_end - j);
+                micro_kernel(
+                    A + i * K + k0,
+                    B + k0 * N + j,
+                    C + i * N + j,
+                    mr, nr, K_len, K, N, N);
             }
         }
     }
@@ -206,11 +252,33 @@ public:
 
     // Apply a unary function element-wise, returning a new matrix
     template <typename Fn>
-    Mat apply(Fn fn) const {
+    Mat apply(Fn fn, std::vector<std::thread>* threads = nullptr) const {
         Mat result(rows_, cols_);
-        for (std::size_t i = 0; i < data_.size(); ++i) {
-            result.data_[i] = fn(data_[i]);
+        const std::size_t n = data_.size();
+
+        auto worker = [&](std::size_t start, std::size_t end) {
+            for (std::size_t i = start; i < end; ++i) {
+                result.data_[i] = fn(data_[i]);
+            }
+        };
+
+        constexpr std::size_t NUM_THREADS = 30;
+        if (threads && n > 1) {
+            threads->clear();
+            const std::size_t per_thread = (n + NUM_THREADS - 1) / NUM_THREADS;
+            for (std::size_t t = 0; t < NUM_THREADS; ++t) {
+                const std::size_t start = t * per_thread;
+                const std::size_t end = std::min(start + per_thread, n);
+                if (start >= n) break;
+                threads->emplace_back(worker, start, end);
+            }
+            for (auto& th : *threads) {
+                th.join();
+            }
+        } else {
+            worker(0, n);
         }
+
         return result;
     }
 

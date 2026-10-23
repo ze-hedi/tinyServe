@@ -231,7 +231,7 @@ public:
         // silu(gate) ⊙ up
         Mat<T> activated = gate.apply([](T z) {
             return z / (T{1} + std::exp(-z));  // silu(z) = z * sigmoid(z)
-        });
+        }, threads);
         Mat<T> fused = activated.hadamard(up);
 
         return fused.matmul(W_down_, threads);  // (seq_len, d_model)
