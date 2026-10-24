@@ -26,3 +26,8 @@ add_test(NAME test_mat COMMAND $<TARGET_FILE:test_mat>)
 add_test(NAME test_embeddings COMMAND $<TARGET_FILE:test_embeddings>)
 add_test(NAME test_gqa COMMAND $<TARGET_FILE:test_gqa>)
 add_test(NAME test_llama_block COMMAND $<TARGET_FILE:test_llama_block>)
+
+# add_executable(test_tokenizer test_tokenizer.cpp)
+# target_include_directories(test_tokenizer PRIVATE ${CMAKE_SOURCE_DIR}/include)
+# target_link_libraries(test_tokenizer PRIVATE gtest pcre2-8)
+# add_test(NAME test_tokenizer COMMAND $<TARGET_FILE:test_tokenizer>)

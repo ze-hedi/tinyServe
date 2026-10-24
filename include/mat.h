@@ -1,5 +1,7 @@
 #pragma once
 
+#include "mmap_block_loader.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -20,6 +22,9 @@ public:
             throw std::invalid_argument("data size does not match dimensions");
         }
     }
+
+    Mat(T* mapped_data, std::size_t rows, std::size_t cols)
+        : mmap_data_(mapped_data), rows_{rows}, cols_{cols}{}
 
     std::size_t rows() const { return rows_; }
     std::size_t cols() const { return cols_; }
@@ -132,6 +137,68 @@ public:
         Mat result(M, N);
         const T* A_ptr = data_.data();
         const T* B_ptr = B.data_.data();
+        T* C_ptr = result.data_.data();
+
+        auto worker = [&](std::size_t row_start, std::size_t row_end) {
+            for (std::size_t i0 = row_start; i0 < row_end; i0 += TI) {
+                const std::size_t i_end = std::min(i0 + TI, row_end);
+                for (std::size_t j0 = 0; j0 < N; j0 += TJ) {
+                    const std::size_t j_end = std::min(j0 + TJ, N);
+                    for (std::size_t k0 = 0; k0 < K; k0 += TK) {
+                        const std::size_t k_end = std::min(k0 + TK, K);
+                        matmul_tile(A_ptr, B_ptr, C_ptr, K, N,
+                                    i0, i_end, j0, j_end, k0, k_end);
+                    }
+                }
+            }
+        };
+
+        const std::size_t rows_per_thread = (M + NUM_THREADS - 1) / NUM_THREADS;
+        if (threads) {
+            threads->clear();
+            for (std::size_t t = 0; t < NUM_THREADS; ++t) {
+                const std::size_t row_start = t * rows_per_thread;
+                const std::size_t row_end = std::min(row_start + rows_per_thread, M);
+                if (row_start >= M) break;
+                threads->emplace_back(worker, row_start, row_end);
+            }
+            for (auto& th : *threads) {
+                th.join();
+            }
+        } else {
+            std::vector<std::thread> local_threads;
+            local_threads.reserve(NUM_THREADS);
+            for (std::size_t t = 0; t < NUM_THREADS; ++t) {
+                const std::size_t row_start = t * rows_per_thread;
+                const std::size_t row_end = std::min(row_start + rows_per_thread, M);
+                if (row_start >= M) break;
+                local_threads.emplace_back(worker, row_start, row_end);
+            }
+            for (auto& th : local_threads) {
+                th.join();
+            }
+        }
+        return result;
+    }
+
+    // A(m, k) * B_mmap(k, n) -> C(m, n)  — same tiling, B is an MMapWeight
+    Mat matmul(const MMapWeight& B, std::vector<std::thread>* threads = nullptr) const {
+        if (cols_ != B.rows()) {
+            throw std::invalid_argument("matmul(MMapWeight): dimension mismatch");
+        }
+
+        const std::size_t M = rows_;
+        const std::size_t K = cols_;
+        const std::size_t N = B.cols();
+        constexpr std::size_t TI = 64;
+        constexpr std::size_t TJ = 64;
+        constexpr std::size_t TK = 64;
+
+        constexpr std::size_t NUM_THREADS = 30;
+
+        Mat result(M, N);
+        const T* A_ptr = data_.data();
+        const float* B_ptr = B.data();
         T* C_ptr = result.data_.data();
 
         auto worker = [&](std::size_t row_start, std::size_t row_end) {
@@ -334,4 +401,5 @@ private:
     std::size_t rows_;
     std::size_t cols_;
     std::vector<T> data_;
+    T* mmap_data_ = nullptr; 
 };

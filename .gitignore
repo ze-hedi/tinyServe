@@ -1,2 +1,4 @@
 build/
+build-*/
 .env
+bloc_0/

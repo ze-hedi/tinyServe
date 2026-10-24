@@ -18,12 +18,12 @@ static Mat<float> ones_row(std::size_t cols) {
 }
 
 int main() {
-    constexpr std::size_t d_model   = 512;
-    constexpr std::size_t n_heads   = 8;
+    constexpr std::size_t d_model   = 2048;
+    constexpr std::size_t n_heads   = 16;
     constexpr std::size_t n_kv_heads = 4;
-    constexpr std::size_t head_dim  = d_model / n_heads; // 64
-    constexpr std::size_t d_ff      = 1376; // ≈ 8/3 * d_model, rounded to even
-    constexpr std::size_t seq_len   = 4000;
+    constexpr std::size_t head_dim  = d_model / n_heads; // 128
+    constexpr std::size_t d_ff      = 11008;
+    constexpr std::size_t seq_len   = 2;
 
     std::mt19937 rng(42);
 

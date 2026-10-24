@@ -1,6 +1,7 @@
 #pragma once
 
 #include "mat.h"
+#include "mmap_block_loader.h"
 
 #include <cmath>
 #include <cstddef>
@@ -22,14 +23,17 @@ void apply_rope(Mat<T>& x, std::size_t pos_offset = 0) {
     for (std::size_t i = 0; i < seq_len; ++i) {
         std::size_t pos = pos_offset + i;
         for (std::size_t j = 0; j < head_dim / 2; ++j) {
-            T theta = static_cast<T>(pos) /
-                      std::pow(T{10000}, static_cast<T>(2 * j) / static_cast<T>(head_dim));
-            T cos_t = std::cos(theta);
-            T sin_t = std::sin(theta);
-            T x0 = x(i, 2 * j);
-            T x1 = x(i, 2 * j + 1);
-            x(i, 2 * j)     = x0 * cos_t - x1 * sin_t;
-            x(i, 2 * j + 1) = x0 * sin_t + x1 * cos_t;
+            // Compute RoPE in float so low-precision element types (such as
+            // BF16) do not narrow constants like 10000 before the calculation.
+            const float theta = static_cast<float>(pos) /
+                std::pow(10000.0f,
+                         static_cast<float>(2 * j) / static_cast<float>(head_dim));
+            const float cos_t = std::cos(theta);
+            const float sin_t = std::sin(theta);
+            const float x0 = static_cast<float>(x(i, 2 * j));
+            const float x1 = static_cast<float>(x(i, 2 * j + 1));
+            x(i, 2 * j) = static_cast<T>(x0 * cos_t - x1 * sin_t);
+            x(i, 2 * j + 1) = static_cast<T>(x0 * sin_t + x1 * cos_t);
         }
     }
 }
@@ -141,7 +145,7 @@ template <typename T>
 class RMSNorm {
 public:
     // gamma: (1, d_model) row vector of scale weights
-    RMSNorm(Mat<T> gamma, T eps = T{1e-6})
+    RMSNorm(Mat<T> gamma, T eps = static_cast<T>(1e-6f))
         : gamma_{std::move(gamma)}, eps_{eps} {
         if (gamma_.rows() != 1) {
             throw std::invalid_argument("RMSNorm: gamma must be a (1, d_model) row vector");
