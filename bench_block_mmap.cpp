@@ -1,58 +1,234 @@
 #include "llama_mmap_block.h"
+#include "llama_transformer.h"
 
+#include <algorithm>
 #include <chrono>
+#include <cctype>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
+#include <limits>
+#include <numeric>
 #include <random>
+#include <stdexcept>
+#include <string>
+#include <sys/resource.h>
 #include <vector>
 
-static Mat<float> random_mat(std::size_t rows, std::size_t cols, std::mt19937& rng) {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+
+struct Options {
+    std::string block_dir = "bloc_0";
+    std::size_t seq_len = 200;
+    std::size_t threads = mat_detail::hardware_thread_count();
+    std::size_t warmup = 0;
+    std::size_t iterations = 1;
+    MMapLoadOptions mmap_options;
+    bool check_reference = false;
+};
+
+struct Faults {
+    long minor = 0;
+    long major = 0;
+};
+
+[[noreturn]] void usage(const char* program, int status = 2) {
+    std::fprintf(stderr,
+                 "Usage: %s [block_dir] [--seq N] [--threads N] "
+                 "[--warmup N] [--iters N] [--prefault] [--hugepages] [--check]\n",
+                 program);
+    std::exit(status);
+}
+
+std::size_t parse_size(const char* value, const char* option, bool allow_zero = false) {
+    std::string text(value);
+    if (text.empty() ||
+        !std::all_of(text.begin(), text.end(), [](unsigned char c) { return std::isdigit(c) != 0; })) {
+        throw std::invalid_argument(std::string("invalid value for ") + option);
+    }
+    std::size_t parsed = 0;
+    const auto result = std::stoull(text, &parsed);
+    if (parsed != text.size() || result > std::numeric_limits<std::size_t>::max() ||
+        (!allow_zero && result == 0)) {
+        throw std::invalid_argument(std::string("invalid value for ") + option);
+    }
+    return result;
+}
+
+Options parse_options(int argc, char* argv[]) {
+    Options options;
+    bool has_block_dir = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg(argv[i]);
+        if (arg == "--help") {
+            usage(argv[0], 0);
+        }
+        if (!arg.starts_with("--")) {
+            if (has_block_dir) usage(argv[0]);
+            options.block_dir = arg;
+            has_block_dir = true;
+            continue;
+        }
+        if (arg == "--check") {
+            options.check_reference = true;
+            continue;
+        }
+        if (arg == "--prefault") {
+            options.mmap_options.prefault = true;
+            continue;
+        }
+        if (arg == "--hugepages") {
+            options.mmap_options.huge_pages = true;
+            continue;
+        }
+        if (i + 1 >= argc) usage(argv[0]);
+        const char* value = argv[++i];
+        if (arg == "--seq") {
+            options.seq_len = parse_size(value, "--seq");
+        } else if (arg == "--threads") {
+            options.threads = parse_size(value, "--threads");
+        } else if (arg == "--warmup") {
+            options.warmup = parse_size(value, "--warmup", true);
+        } else if (arg == "--iters") {
+            options.iterations = parse_size(value, "--iters");
+        } else {
+            usage(argv[0]);
+        }
+    }
+    return options;
+}
+
+Mat<float> random_mat(std::size_t rows, std::size_t cols, std::mt19937& rng) {
     std::normal_distribution<float> dist(0.0f, 0.02f);
     std::vector<float> data(rows * cols);
     for (auto& v : data) v = dist(rng);
     return Mat<float>(rows, cols, std::move(data));
 }
 
+Mat<float> copy_weight(const MMapWeight& weight) {
+    const float* source = weight.data();
+    return Mat<float>(weight.rows(), weight.cols(),
+                      std::vector<float>(source, source + weight.rows() * weight.cols()));
+}
+
+Faults faults() {
+    rusage usage_info{};
+    if (::getrusage(RUSAGE_SELF, &usage_info) != 0) {
+        throw std::runtime_error("getrusage failed");
+    }
+    return {usage_info.ru_minflt, usage_info.ru_majflt};
+}
+
+double checksum(const Mat<float>& matrix) {
+    double sum = 0.0;
+    for (std::size_t r = 0; r < matrix.rows(); ++r) {
+        for (std::size_t c = 0; c < matrix.cols(); ++c) {
+            sum += matrix(r, c);
+        }
+    }
+    return sum;
+}
+
+} // namespace
+
 int main(int argc, char* argv[]) {
-    const char* block_dir = "bloc_0";
-    if (argc > 1) block_dir = argv[1];
+    try {
+        const auto options = parse_options(argc, argv);
+        constexpr std::size_t d_model = 2048;
+        constexpr std::size_t n_heads = 16;
+        constexpr std::size_t n_kv_heads = 4;
+        constexpr std::size_t head_dim = d_model / n_heads;
 
-    constexpr std::size_t d_model    = 2048;
-    constexpr std::size_t n_heads    = 16;
-    constexpr std::size_t n_kv_heads = 4;
-    constexpr std::size_t head_dim   = d_model / n_heads; // 128
-    constexpr std::size_t seq_len    = 200;
+        const auto load_faults_before = faults();
+        const auto load_start = Clock::now();
+        auto weights = load_mapped_llama_block(options.block_dir, options.mmap_options);
+        const auto load_end = Clock::now();
+        const auto load_faults_after = faults();
+        const double load_ms = std::chrono::duration<double, std::milli>(load_end - load_start).count();
 
-    std::printf("Loading mmap weights from '%s'...\n", block_dir);
-    auto weights = load_mapped_llama_block(block_dir);
+        LlamaBlock_MMap<float> block(n_heads, n_kv_heads, head_dim, weights, options.threads);
+        std::mt19937 rng(42);
+        const auto x = random_mat(options.seq_len, d_model, rng);
 
-    std::printf("Building LlamaBlock_MMap: d_model=%zu, n_heads=%zu, n_kv_heads=%zu, "
-                "head_dim=%zu, seq_len=%zu\n",
-                d_model, n_heads, n_kv_heads, head_dim, seq_len);
+        std::printf(
+            "config: d_model=%zu heads=%zu kv_heads=%zu head_dim=%zu seq=%zu "
+            "threads=%zu warmup=%zu iters=%zu prefault=%d hugepage_advice=%d "
+            "load_ms=%.3f load_minor_faults=%ld load_major_faults=%ld\n",
+            d_model, n_heads, n_kv_heads, head_dim, options.seq_len, options.threads,
+            options.warmup, options.iterations, options.mmap_options.prefault,
+            options.mmap_options.huge_pages, load_ms,
+            load_faults_after.minor - load_faults_before.minor,
+            load_faults_after.major - load_faults_before.major);
 
-    LlamaBlock_MMap<float> block(n_heads, n_kv_heads, head_dim, weights);
+        Mat<float> out(0, 0);
+        for (std::size_t i = 0; i < options.warmup; ++i) {
+            const auto start = Clock::now();
+            out = block.forward(x);
+            const auto end = Clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+            std::printf("warmup[%zu]: %.3f ms checksum=%.9g\n", i, ms, checksum(out));
+        }
 
-    // Input: random "logits" as if coming from an embedding layer
-    std::mt19937 rng(42);
-    auto x = random_mat(seq_len, d_model, rng);
+        std::vector<double> samples;
+        samples.reserve(options.iterations);
+        for (std::size_t i = 0; i < options.iterations; ++i) {
+            const auto faults_before = faults();
+            const auto start = Clock::now();
+            out = block.forward(x);
+            const auto end = Clock::now();
+            const auto faults_after = faults();
+            const double ms = std::chrono::duration<double, std::milli>(end - start).count();
+            samples.push_back(ms);
+            std::printf(
+                "iteration[%zu]: %.3f ms checksum=%.9g minor_faults=%ld major_faults=%ld\n",
+                i, ms, checksum(out), faults_after.minor - faults_before.minor,
+                faults_after.major - faults_before.major);
+        }
 
-    std::printf("Running forward pass...\n");
+        std::vector<double> sorted = samples;
+        std::sort(sorted.begin(), sorted.end());
+        const double mean = std::accumulate(samples.begin(), samples.end(), 0.0) / samples.size();
+        const double median = sorted.size() % 2 == 0
+            ? (sorted[sorted.size() / 2 - 1] + sorted[sorted.size() / 2]) / 2.0
+            : sorted[sorted.size() / 2];
+        std::printf("summary: median=%.3f ms mean=%.3f ms min=%.3f ms max=%.3f ms\n",
+                    median, mean, sorted.front(), sorted.back());
+        std::printf("output: shape=(%zu,%zu) first=%.6f last=%.6f\n",
+                    out.rows(), out.cols(), out(0, 0), out(out.rows() - 1, 0));
 
-    auto t0 = std::chrono::high_resolution_clock::now();
-    auto out = block.forward(x);
-    auto t1 = std::chrono::high_resolution_clock::now();
-
-    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-    std::printf("Done. Output shape: (%zu, %zu)\n", out.rows(), out.cols());
-    std::printf("Wall time: %.1f ms\n", ms);
-
-    // Print a few output values as a sanity check
-    std::printf("out[0][0..3] = %.6f  %.6f  %.6f  %.6f\n",
-                out(0, 0), out(0, 1), out(0, 2), out(0, 3));
-    std::printf("out[%zu][0..3] = %.6f  %.6f  %.6f  %.6f\n",
-                seq_len - 1,
-                out(seq_len - 1, 0), out(seq_len - 1, 1),
-                out(seq_len - 1, 2), out(seq_len - 1, 3));
-
-    return 0;
+        if (options.check_reference) {
+            LlamaBlock<float> reference(
+                RMSNorm<float>(copy_weight(weights.input_layernorm)),
+                GQA<float>(n_heads, n_kv_heads, head_dim,
+                           copy_weight(weights.q_proj), copy_weight(weights.k_proj),
+                           copy_weight(weights.v_proj), copy_weight(weights.o_proj)),
+                RMSNorm<float>(copy_weight(weights.post_attention_layernorm)),
+                SwiGLU<float>(copy_weight(weights.gate_proj), copy_weight(weights.up_proj),
+                              copy_weight(weights.down_proj)));
+            const auto expected = reference.forward(x);
+            double max_abs_error = 0.0;
+            double max_relative_error = 0.0;
+            for (std::size_t r = 0; r < out.rows(); ++r) {
+                for (std::size_t c = 0; c < out.cols(); ++c) {
+                    const double error = std::abs(static_cast<double>(out(r, c)) - expected(r, c));
+                    max_abs_error = std::max(max_abs_error, error);
+                    const double relative = error / std::max(1e-12, std::abs(static_cast<double>(expected(r, c))));
+                    max_relative_error = std::max(max_relative_error, relative);
+                    if (!std::isfinite(out(r, c)) || !std::isfinite(expected(r, c)) ||
+                        error > 1e-4 + 1e-4 * std::abs(expected(r, c))) {
+                        throw std::runtime_error("mmap output differs from the non-mmap reference");
+                    }
+                }
+            }
+            std::printf("reference: max_abs_error=%.9g max_relative_error=%.9g status=ok\n",
+                        max_abs_error, max_relative_error);
+        }
+        return 0;
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "bench_block_mmap: %s\n", error.what());
+        return 1;
+    }
 }

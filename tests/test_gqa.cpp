@@ -1,4 +1,5 @@
 #include "llama_transformer.h"
+#include "llama_mmap_block.h"
 
 #include <cmath>
 #include <cstddef>
@@ -256,6 +257,34 @@ TEST(RoPETest, PreservesNorm) {
         for (std::size_t d = 0; d < head_dim; ++d)
             norm_after += x(i, d) * x(i, d);
         EXPECT_NEAR(norm_after, norms_before[i], 1e-4f) << "norm changed at row " << i;
+    }
+}
+
+TEST(RoPETest, MMapMultiHeadMatchesPerHeadReference) {
+    constexpr std::size_t seq_len = 5;
+    constexpr std::size_t n_heads = 3;
+    constexpr std::size_t head_dim = 8;
+    constexpr std::size_t pos_offset = 2;
+    std::mt19937 rng(123);
+    auto actual = random_mat(seq_len, n_heads * head_dim, rng);
+    Mat<float> expected(seq_len, n_heads * head_dim);
+    for (std::size_t r = 0; r < seq_len; ++r) {
+        for (std::size_t c = 0; c < n_heads * head_dim; ++c) {
+            expected(r, c) = actual(r, c);
+        }
+    }
+    for (std::size_t h = 0; h < n_heads; ++h) {
+        auto head = expected.slice_cols(h * head_dim, head_dim);
+        gqa_mmap_detail::apply_rope(head, pos_offset);
+        expected.set_cols(h * head_dim, head);
+    }
+
+    gqa_mmap_detail::apply_rope_heads(actual, n_heads, head_dim, pos_offset);
+    for (std::size_t r = 0; r < seq_len; ++r) {
+        for (std::size_t c = 0; c < n_heads * head_dim; ++c) {
+            EXPECT_NEAR(actual(r, c), expected(r, c), 1e-6f)
+                << "row=" << r << " col=" << c;
+        }
     }
 }
 

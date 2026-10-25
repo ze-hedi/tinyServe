@@ -19,11 +19,17 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+struct MMapLoadOptions {
+    bool prefault = false;
+    bool huge_pages = false;
+};
+
 class ReadOnlyMapping {
 public:
     ReadOnlyMapping() = default;
 
-    explicit ReadOnlyMapping(const std::filesystem::path& path) {
+    explicit ReadOnlyMapping(const std::filesystem::path& path,
+                             const MMapLoadOptions& options = {}) {
         fd_ = ::open(path.c_str(), O_RDONLY);
         if (fd_ == -1) {
             throw std::runtime_error("mmap loader: cannot open '" + path.string() + "'");
@@ -42,12 +48,40 @@ public:
             throw std::runtime_error("mmap loader: file is empty: '" + path.string() + "'");
         }
 
-        data_ = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        int flags = MAP_PRIVATE;
+        if (options.prefault) {
+#ifdef MAP_POPULATE
+            flags |= MAP_POPULATE;
+#else
+            ::close(fd_);
+            fd_ = -1;
+            throw std::runtime_error("mmap loader: prefault is unsupported on this platform");
+#endif
+        }
+        data_ = ::mmap(nullptr, size_, PROT_READ, flags, fd_, 0);
         if (data_ == MAP_FAILED) {
             data_ = nullptr;
             ::close(fd_);
             fd_ = -1;
             throw std::runtime_error("mmap loader: mmap failed for '" + path.string() + "'");
+        }
+        if (options.huge_pages) {
+#ifdef MADV_HUGEPAGE
+            if (::madvise(data_, size_, MADV_HUGEPAGE) != 0) {
+                ::munmap(data_, size_);
+                data_ = nullptr;
+                ::close(fd_);
+                fd_ = -1;
+                throw std::runtime_error(
+                    "mmap loader: MADV_HUGEPAGE failed for '" + path.string() + "'");
+            }
+#else
+            ::munmap(data_, size_);
+            data_ = nullptr;
+            ::close(fd_);
+            fd_ = -1;
+            throw std::runtime_error("mmap loader: huge pages are unsupported on this platform");
+#endif
         }
     }
 
@@ -100,7 +134,8 @@ public:
     // Parse manifest entry, mmap the .bin file, and reinterpret as float*.
     void load(const std::filesystem::path& directory,
               const nlohmann::json& manifest,
-              const std::string& name) {
+              const std::string& name,
+              const MMapLoadOptions& options = {}) {
         const nlohmann::json* entry = nullptr;
         for (const auto& tensor : manifest.at("tensors")) {
             if (tensor.at("name").get<std::string>() == name) {
@@ -144,7 +179,7 @@ public:
             throw std::runtime_error("mmap loader: tensor filename must be a simple file name");
         }
 
-        mapping_ = ReadOnlyMapping(directory / relative_path);
+        mapping_ = ReadOnlyMapping(directory / relative_path, options);
         if (mapping_.size() != byte_count) {
             throw std::runtime_error("mmap loader: file size mismatch for tensor '" + name + "'");
         }
@@ -171,7 +206,9 @@ struct MMapLlamaBlockWeights {
     MMapWeight down_proj;
 };
 
-inline MMapLlamaBlockWeights load_mapped_llama_block(const std::filesystem::path& directory) {
+inline MMapLlamaBlockWeights load_mapped_llama_block(
+        const std::filesystem::path& directory,
+        const MMapLoadOptions& options = {}) {
     const auto manifest_path = directory / "shapes.json";
     std::ifstream manifest_file(manifest_path);
     if (!manifest_file) {
@@ -190,14 +227,14 @@ inline MMapLlamaBlockWeights load_mapped_llama_block(const std::filesystem::path
     }
 
     MMapLlamaBlockWeights weights;
-    weights.input_layernorm.load(directory, manifest, "input_layernorm");
-    weights.q_proj.load(directory, manifest, "q_proj");
-    weights.k_proj.load(directory, manifest, "k_proj");
-    weights.v_proj.load(directory, manifest, "v_proj");
-    weights.o_proj.load(directory, manifest, "o_proj");
-    weights.post_attention_layernorm.load(directory, manifest, "post_attention_layernorm");
-    weights.gate_proj.load(directory, manifest, "gate_proj");
-    weights.up_proj.load(directory, manifest, "up_proj");
-    weights.down_proj.load(directory, manifest, "down_proj");
+    weights.input_layernorm.load(directory, manifest, "input_layernorm", options);
+    weights.q_proj.load(directory, manifest, "q_proj", options);
+    weights.k_proj.load(directory, manifest, "k_proj", options);
+    weights.v_proj.load(directory, manifest, "v_proj", options);
+    weights.o_proj.load(directory, manifest, "o_proj", options);
+    weights.post_attention_layernorm.load(directory, manifest, "post_attention_layernorm", options);
+    weights.gate_proj.load(directory, manifest, "gate_proj", options);
+    weights.up_proj.load(directory, manifest, "up_proj", options);
+    weights.down_proj.load(directory, manifest, "down_proj", options);
     return weights;
 }
