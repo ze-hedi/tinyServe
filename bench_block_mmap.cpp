@@ -1,5 +1,6 @@
 #include "llama_mmap_block.h"
 #include "llama_transformer.h"
+#include "thread_pool.h"
 
 #include <algorithm>
 #include <chrono>
@@ -149,7 +150,8 @@ int main(int argc, char* argv[]) {
         const auto load_faults_after = faults();
         const double load_ms = std::chrono::duration<double, std::milli>(load_end - load_start).count();
 
-        LlamaBlock_MMap<float> block(n_heads, n_kv_heads, head_dim, weights, options.threads);
+        ThreadPool pool(options.threads);
+        LlamaBlock_MMap<float> block(n_heads, n_kv_heads, head_dim, weights, pool);
         std::mt19937 rng(42);
         const auto x = random_mat(options.seq_len, d_model, rng);
 
@@ -207,7 +209,8 @@ int main(int argc, char* argv[]) {
                            copy_weight(weights.v_proj), copy_weight(weights.o_proj)),
                 RMSNorm<float>(copy_weight(weights.post_attention_layernorm)),
                 SwiGLU<float>(copy_weight(weights.gate_proj), copy_weight(weights.up_proj),
-                              copy_weight(weights.down_proj)));
+                              copy_weight(weights.down_proj)),
+                pool);
             const auto expected = reference.forward(x);
             double max_abs_error = 0.0;
             double max_relative_error = 0.0;

@@ -1,4 +1,5 @@
 #include "llama_transformer.h"
+#include "thread_pool.h"
 
 #include <chrono>
 #include <cstddef>
@@ -48,8 +49,9 @@ int main() {
     RMSNorm<float> ffn_norm(ones_row(d_model));
     SwiGLU<float> mlp(std::move(W_gate), std::move(W_up), std::move(W_down));
 
+    ThreadPool pool(mat_detail::hardware_thread_count());
     LlamaBlock<float> block(std::move(attn_norm), std::move(attn),
-                            std::move(ffn_norm), std::move(mlp));
+                            std::move(ffn_norm), std::move(mlp), pool);
 
     // Input: random "logits" as if coming from an embedding layer
     auto x = random_mat(seq_len, d_model, rng);

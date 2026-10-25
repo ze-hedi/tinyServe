@@ -2,6 +2,7 @@
 
 #include "mat.h"
 #include "mmap_block_loader.h"
+#include "thread_pool.h"
 
 #include <cmath>
 #include <cstddef>
@@ -77,7 +78,7 @@ public:
     std::size_t d_model() const { return W_q_.rows(); }
 
     // x: (seq_len, d_model) -> output: (seq_len, d_model)
-    Mat<T> forward(const Mat<T>& x, std::vector<std::thread>* threads = nullptr) const {
+    Mat<T> forward(const Mat<T>& x, ThreadPool& pool) const {
         if (x.cols() != d_model()) {
             throw std::invalid_argument("input cols must equal d_model");
         }
@@ -86,9 +87,9 @@ public:
         std::size_t n_groups = n_heads_ / n_kv_heads_;
 
         // Project
-        Mat<T> Q = x.matmul(W_q_, threads); // (seq_len, n_heads * head_dim)
-        Mat<T> K = x.matmul(W_k_, threads); // (seq_len, n_kv_heads * head_dim)
-        Mat<T> V = x.matmul(W_v_, threads); // (seq_len, n_kv_heads * head_dim)
+        Mat<T> Q = x.matmul(W_q_, pool); // (seq_len, n_heads * head_dim)
+        Mat<T> K = x.matmul(W_k_, pool); // (seq_len, n_kv_heads * head_dim)
+        Mat<T> V = x.matmul(W_v_, pool); // (seq_len, n_kv_heads * head_dim)
 
         T scale = T{1} / std::sqrt(static_cast<T>(head_dim_));
 
@@ -109,7 +110,7 @@ public:
             apply_rope(K_h);
 
             // scores = Q_h @ K_h^T / sqrt(head_dim) -> (seq_len, seq_len)
-            Mat<T> scores = Q_h.matmul(K_h.transpose(), threads);
+            Mat<T> scores = Q_h.matmul(K_h.transpose(), pool);
             scores.scale(scale);
 
             // Causal mask: zero out future positions
@@ -119,14 +120,14 @@ public:
             scores.softmax_rows();
 
             // attn_out = scores @ V_h -> (seq_len, head_dim)
-            Mat<T> attn_out = scores.matmul(V_h, threads);
+            Mat<T> attn_out = scores.matmul(V_h, pool);
 
             // Write into concat
             concat.set_cols(h * head_dim_, attn_out);
         }
 
         // Output projection: (seq_len, n_heads * head_dim) @ W_o -> (seq_len, d_model)
-        return concat.matmul(W_o_, threads);
+        return concat.matmul(W_o_, pool);
     }
 
 private:
@@ -155,7 +156,7 @@ public:
     std::size_t d_model() const { return gamma_.cols(); }
 
     // x: (seq_len, d_model) -> (seq_len, d_model)
-    Mat<T> forward(const Mat<T>& x, std::vector<std::thread>* threads = nullptr) const {
+    Mat<T> forward(const Mat<T>& x, ThreadPool& pool) const {
         if (x.cols() != d_model()) {
             throw std::invalid_argument("RMSNorm: input cols must equal d_model");
         }
@@ -176,22 +177,15 @@ public:
             }
         };
 
-        constexpr std::size_t NUM_THREADS = 30;
-        if (threads && seq_len > 1) {
-            threads->clear();
-            const std::size_t rows_per_thread = (seq_len + NUM_THREADS - 1) / NUM_THREADS;
-            for (std::size_t t = 0; t < NUM_THREADS; ++t) {
-                const std::size_t r_start = t * rows_per_thread;
-                const std::size_t r_end = std::min(r_start + rows_per_thread, seq_len);
-                if (r_start >= seq_len) break;
-                threads->emplace_back(worker, r_start, r_end);
-            }
-            for (auto& th : *threads) {
-                th.join();
-            }
-        } else {
-            worker(0, seq_len);
+        if (seq_len == 0) {
+            return result;
         }
+        const std::size_t worker_count = std::min(pool.size(), seq_len);
+        const std::size_t rows_per_worker = (seq_len + worker_count - 1) / worker_count;
+        pool.run(worker_count, [&](std::size_t t) {
+            const std::size_t r_start = t * rows_per_worker;
+            worker(r_start, std::min(r_start + rows_per_worker, seq_len));
+        });
 
         return result;
     }
@@ -225,20 +219,20 @@ public:
     std::size_t d_ff() const { return W_gate_.cols(); }
 
     // x: (seq_len, d_model) -> (seq_len, d_model)
-    Mat<T> forward(const Mat<T>& x, std::vector<std::thread>* threads = nullptr) const {
+    Mat<T> forward(const Mat<T>& x, ThreadPool& pool) const {
         if (x.cols() != d_model()) {
             throw std::invalid_argument("SwiGLU: input cols must equal d_model");
         }
-        Mat<T> gate = x.matmul(W_gate_, threads);  // (seq_len, d_ff)
-        Mat<T> up = x.matmul(W_up_, threads);      // (seq_len, d_ff)
+        Mat<T> gate = x.matmul(W_gate_, pool);  // (seq_len, d_ff)
+        Mat<T> up = x.matmul(W_up_, pool);      // (seq_len, d_ff)
 
         // silu(gate) ⊙ up
         Mat<T> activated = gate.apply([](T z) {
             return z / (T{1} + std::exp(-z));  // silu(z) = z * sigmoid(z)
-        }, threads);
+        }, pool);
         Mat<T> fused = activated.hadamard(up);
 
-        return fused.matmul(W_down_, threads);  // (seq_len, d_model)
+        return fused.matmul(W_down_, pool);  // (seq_len, d_model)
     }
 
 private:
@@ -254,16 +248,14 @@ template <typename T>
 class LlamaBlock {
 public:
     LlamaBlock(RMSNorm<T> attn_norm, GQA<T> attn,
-               RMSNorm<T> ffn_norm, SwiGLU<T> mlp)
+               RMSNorm<T> ffn_norm, SwiGLU<T> mlp, ThreadPool& pool)
         : attn_norm_{std::move(attn_norm)}, attn_{std::move(attn)},
-          ffn_norm_{std::move(ffn_norm)}, mlp_{std::move(mlp)} {
-        threads_.reserve(30);
-    }
+          ffn_norm_{std::move(ffn_norm)}, mlp_{std::move(mlp)}, pool_{pool} {}
 
     // x: (seq_len, d_model) -> (seq_len, d_model)
     Mat<T> forward(const Mat<T>& x) {
-        Mat<T> h = x.add(attn_.forward(attn_norm_.forward(x, &threads_), &threads_));
-        return h.add(mlp_.forward(ffn_norm_.forward(h, &threads_), &threads_));
+        Mat<T> h = x.add(attn_.forward(attn_norm_.forward(x, pool_), pool_));
+        return h.add(mlp_.forward(ffn_norm_.forward(h, pool_), pool_));
     }
 
 private:
@@ -271,5 +263,5 @@ private:
     GQA<T> attn_;
     RMSNorm<T> ffn_norm_;
     SwiGLU<T> mlp_;
-    std::vector<std::thread> threads_;
+    ThreadPool& pool_;
 };

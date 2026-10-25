@@ -2,6 +2,7 @@
 
 #include "mat.h"
 #include "mmap_block_loader.h"
+#include "thread_pool.h"
 
 #include <algorithm>
 #include <cmath>
@@ -112,8 +113,7 @@ public:
     std::size_t d_model() const { return W_q_->rows(); }
 
     // x: (seq_len, d_model) -> output: (seq_len, d_model)
-    Mat<T> forward(const Mat<T>& x, std::vector<std::thread>* threads = nullptr,
-                   std::size_t num_threads = mat_detail::hardware_thread_count()) const {
+    Mat<T> forward(const Mat<T>& x, ThreadPool& pool) const {
         if (x.cols() != d_model()) {
             throw std::invalid_argument("input cols must equal d_model");
         }
@@ -122,9 +122,9 @@ public:
         std::size_t n_groups = n_heads_ / n_kv_heads_;
 
         // Project using mmap weights
-        Mat<T> Q = x.matmul(*W_q_, threads, num_threads); // (seq_len, n_heads * head_dim)
-        Mat<T> K = x.matmul(*W_k_, threads, num_threads); // (seq_len, n_kv_heads * head_dim)
-        Mat<T> V = x.matmul(*W_v_, threads, num_threads); // (seq_len, n_kv_heads * head_dim)
+        Mat<T> Q = x.matmul(*W_q_, pool); // (seq_len, n_heads * head_dim)
+        Mat<T> K = x.matmul(*W_k_, pool); // (seq_len, n_kv_heads * head_dim)
+        Mat<T> V = x.matmul(*W_v_, pool); // (seq_len, n_kv_heads * head_dim)
 
         gqa_mmap_detail::apply_rope_heads(Q, n_heads_, head_dim_);
         gqa_mmap_detail::apply_rope_heads(K, n_kv_heads_, head_dim_);
@@ -143,18 +143,18 @@ public:
             Mat<T> V_h = V.slice_cols(kv_h * head_dim_, head_dim_);
 
             // scores = Q_h @ K_h^T / sqrt(head_dim) -> (seq_len, seq_len)
-            Mat<T> scores = Q_h.matmul(K_h.transpose(), threads, num_threads);
+            Mat<T> scores = Q_h.matmul(K_h.transpose(), pool);
             scores.scale(scale);
 
             scores.masked_fill(-std::numeric_limits<T>::infinity(), true);
             scores.softmax_rows();
 
-            Mat<T> attn_out = scores.matmul(V_h, threads, num_threads);
+            Mat<T> attn_out = scores.matmul(V_h, pool);
             concat.set_cols(h * head_dim_, attn_out);
         }
 
         // Output projection
-        return concat.matmul(*W_o_, threads, num_threads);
+        return concat.matmul(*W_o_, pool);
     }
 
 private:
@@ -191,16 +191,15 @@ public:
     std::size_t d_ff() const { return W_gate_->cols(); }
 
     // x: (seq_len, d_model) -> (seq_len, d_model)
-    Mat<T> forward(const Mat<T>& x, std::vector<std::thread>* threads = nullptr,
-                   std::size_t num_threads = mat_detail::hardware_thread_count()) const {
+    Mat<T> forward(const Mat<T>& x, ThreadPool& pool) const {
         if (x.cols() != d_model()) {
             throw std::invalid_argument("SwiGLU_MMap: input cols must equal d_model");
         }
-        Mat<T> gate = x.matmul(*W_gate_, threads, num_threads);  // (seq_len, d_ff)
-        Mat<T> up = x.matmul(*W_up_, threads, num_threads);      // (seq_len, d_ff)
+        Mat<T> gate = x.matmul(*W_gate_, pool);  // (seq_len, d_ff)
+        Mat<T> up = x.matmul(*W_up_, pool);      // (seq_len, d_ff)
 
-        gate.silu_hadamard(up, threads, num_threads);
-        return gate.matmul(*W_down_, threads, num_threads);  // (seq_len, d_model)
+        gate.silu_hadamard(up, pool);
+        return gate.matmul(*W_down_, pool);  // (seq_len, d_model)
     }
 
 private:
@@ -224,8 +223,7 @@ public:
     std::size_t d_model() const { return gamma_->cols(); }
 
     // x: (seq_len, d_model) -> (seq_len, d_model)
-    Mat<T> forward(const Mat<T>& x, std::vector<std::thread>* threads = nullptr,
-                   std::size_t num_threads = mat_detail::hardware_thread_count()) const {
+    Mat<T> forward(const Mat<T>& x, ThreadPool& pool) const {
         if (x.cols() != d_model()) {
             throw std::invalid_argument("RMSNorm_MMap: input cols must equal d_model");
         }
@@ -233,6 +231,9 @@ public:
         std::size_t d = d_model();
         const float* g = gamma_->data();
         Mat<T> result(seq_len, d);
+        if (seq_len == 0) {
+            return result;
+        }
 
         auto worker = [&](std::size_t r_start, std::size_t r_end) {
             for (std::size_t r = r_start; r < r_end; ++r) {
@@ -247,21 +248,12 @@ public:
             }
         };
 
-        if (threads && seq_len > 1 && num_threads > 1) {
-            threads->clear();
-            const std::size_t rows_per_thread = (seq_len + num_threads - 1) / num_threads;
-            for (std::size_t t = 0; t < num_threads; ++t) {
-                const std::size_t r_start = t * rows_per_thread;
-                const std::size_t r_end = std::min(r_start + rows_per_thread, seq_len);
-                if (r_start >= seq_len) break;
-                threads->emplace_back(worker, r_start, r_end);
-            }
-            for (auto& th : *threads) {
-                th.join();
-            }
-        } else {
-            worker(0, seq_len);
-        }
+        const std::size_t worker_count = std::min(pool.size(), seq_len);
+        const std::size_t rows_per_worker = (seq_len + worker_count - 1) / worker_count;
+        pool.run(worker_count, [&](std::size_t t) {
+            const std::size_t r_start = t * rows_per_worker;
+            worker(r_start, std::min(r_start + rows_per_worker, seq_len));
+        });
 
         return result;
     }
@@ -274,27 +266,24 @@ private:
 // Full LLaMA transformer block backed by mmap weights:
 //   h   = x + GQA_MMap(RMSNorm_MMap(x))
 //   out = h + SwiGLU_MMap(RMSNorm_MMap(h))
-// Borrows all weights from an MMapLlamaBlockWeights — caller keeps it alive.
+// Borrows all weights from an MMapLlamaBlockWeights and its thread pool —
+// the caller keeps both alive.
 template <typename T>
 class LlamaBlock_MMap {
 public:
     LlamaBlock_MMap(std::size_t n_heads, std::size_t n_kv_heads, std::size_t head_dim,
-                    const MMapLlamaBlockWeights& w, std::size_t num_threads = mat_detail::hardware_thread_count())
+                    const MMapLlamaBlockWeights& w, ThreadPool& pool)
         : attn_norm_{&w.input_layernorm},
           attn_{n_heads, n_kv_heads, head_dim,
                 &w.q_proj, &w.k_proj, &w.v_proj, &w.o_proj},
           ffn_norm_{&w.post_attention_layernorm},
           mlp_{&w.gate_proj, &w.up_proj, &w.down_proj},
-          num_threads_{std::max<std::size_t>(1, num_threads)} {
-        threads_.reserve(num_threads_);
-    }
+          pool_{pool} {}
 
     // x: (seq_len, d_model) -> (seq_len, d_model)
     Mat<T> forward(const Mat<T>& x) {
-        Mat<T> h = x.add(attn_.forward(attn_norm_.forward(x, &threads_, num_threads_),
-                                      &threads_, num_threads_));
-        return h.add(mlp_.forward(ffn_norm_.forward(h, &threads_, num_threads_),
-                                  &threads_, num_threads_));
+        Mat<T> h = x.add(attn_.forward(attn_norm_.forward(x, pool_), pool_));
+        return h.add(mlp_.forward(ffn_norm_.forward(h, pool_), pool_));
     }
 
 private:
@@ -302,6 +291,5 @@ private:
     GQA_MMap<T> attn_;
     RMSNorm_MMap<T> ffn_norm_;
     SwiGLU_MMap<T> mlp_;
-    std::size_t num_threads_;
-    std::vector<std::thread> threads_;
+    ThreadPool& pool_;
 };

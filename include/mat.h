@@ -2,6 +2,7 @@
 
 #include "mmap_block_loader.h"
 #include "micro_kernels/micro_kernels.h"
+#include "thread_pool.h"
 
 #include <algorithm>
 #include <cmath>
@@ -134,8 +135,7 @@ public:
     }
 
     // A(m, k) * B(k, n) -> C(m, n)  — 3D tiled for cache locality
-    Mat matmul(const Mat& B, std::vector<std::thread>* threads = nullptr,
-               std::size_t num_threads = mat_detail::hardware_thread_count()) const {
+    Mat matmul(const Mat& B, ThreadPool& pool) const {
         if (cols_ != B.rows_) {
             throw std::invalid_argument("matmul: dimension mismatch");
         }
@@ -147,9 +147,10 @@ public:
         constexpr std::size_t TJ = 64;
         constexpr std::size_t TK = 64;
 
-        num_threads = std::max<std::size_t>(1, num_threads);
-
         Mat result(M, N);
+        if (M == 0 || N == 0) {
+            return result;
+        }
         const T* A_ptr = data_.data();
         const T* B_ptr = B.data_.data();
         T* C_ptr = result.data_.data();
@@ -168,37 +169,17 @@ public:
             }
         };
 
-        const std::size_t rows_per_thread = (M + num_threads - 1) / num_threads;
-        if (threads) {
-            threads->clear();
-            for (std::size_t t = 0; t < num_threads; ++t) {
-                const std::size_t row_start = t * rows_per_thread;
-                const std::size_t row_end = std::min(row_start + rows_per_thread, M);
-                if (row_start >= M) break;
-                threads->emplace_back(worker, row_start, row_end);
-            }
-            for (auto& th : *threads) {
-                th.join();
-            }
-        } else {
-            std::vector<std::thread> local_threads;
-            local_threads.reserve(num_threads);
-            for (std::size_t t = 0; t < num_threads; ++t) {
-                const std::size_t row_start = t * rows_per_thread;
-                const std::size_t row_end = std::min(row_start + rows_per_thread, M);
-                if (row_start >= M) break;
-                local_threads.emplace_back(worker, row_start, row_end);
-            }
-            for (auto& th : local_threads) {
-                th.join();
-            }
-        }
+        const std::size_t worker_count = std::min(pool.size(), M);
+        const std::size_t rows_per_worker = (M + worker_count - 1) / worker_count;
+        pool.run(worker_count, [&](std::size_t t) {
+            const std::size_t row_start = t * rows_per_worker;
+            worker(row_start, std::min(row_start + rows_per_worker, M));
+        });
         return result;
     }
 
     // A(m, k) * B_mmap(k, n) -> C(m, n)  — same tiling, B is an MMapWeight
-    Mat matmul(const MMapWeight& B, std::vector<std::thread>* threads = nullptr,
-               std::size_t num_threads = mat_detail::hardware_thread_count()) const {
+    Mat matmul(const MMapWeight& B, ThreadPool& pool) const {
         if (cols_ != B.rows()) {
             throw std::invalid_argument("matmul(MMapWeight): dimension mismatch");
         }
@@ -212,7 +193,6 @@ public:
         constexpr std::size_t MR = 6;
         constexpr std::size_t NR = 16;
 
-        num_threads = std::max<std::size_t>(1, num_threads);
         Mat result(M, N);
         if (M == 0 || N == 0) {
             return result;
@@ -230,9 +210,9 @@ public:
         const bool aligned_b = reinterpret_cast<std::uintptr_t>(B_ptr) % 32 == 0 && N % 8 == 0;
         const std::size_t row_blocks = (M + MR - 1) / MR;
         const std::size_t col_blocks = (N + NR - 1) / NR;
-        const bool split_columns = row_blocks < num_threads && col_blocks > 1;
+        const bool split_columns = row_blocks < pool.size() && col_blocks > 1;
         const std::size_t task_count = split_columns ? col_blocks : row_blocks;
-        const std::size_t worker_count = std::min(num_threads, task_count);
+        const std::size_t worker_count = std::min(pool.size(), task_count);
 
         auto worker = [&](std::size_t task_start, std::size_t task_end) {
             if (split_columns) {
@@ -266,27 +246,11 @@ public:
             }
         };
 
-        auto launch = [&](auto& thread_list) {
-            thread_list.clear();
-            thread_list.reserve(worker_count);
-            for (std::size_t t = 0; t < worker_count; ++t) {
-                const std::size_t task_start = task_count * t / worker_count;
-                const std::size_t task_end = task_count * (t + 1) / worker_count;
-                thread_list.emplace_back(worker, task_start, task_end);
-            }
-            for (auto& thread : thread_list) {
-                thread.join();
-            }
-        };
-
-        if (worker_count == 1) {
-            worker(0, task_count);
-        } else if (threads) {
-            launch(*threads);
-        } else {
-            std::vector<std::thread> local_threads;
-            launch(local_threads);
-        }
+        pool.run(worker_count, [&](std::size_t t) {
+            const std::size_t task_start = task_count * t / worker_count;
+            const std::size_t task_end = task_count * (t + 1) / worker_count;
+            worker(task_start, task_end);
+        });
         return result;
     }
 
@@ -351,12 +315,14 @@ public:
     }
 
     // In-place SiLU(this) * B, avoiding two full-size temporary matrices.
-    void silu_hadamard(const Mat& B, std::vector<std::thread>* threads = nullptr,
-                       std::size_t num_threads = mat_detail::hardware_thread_count()) {
+    void silu_hadamard(const Mat& B, ThreadPool& pool) {
         if (rows_ != B.rows_ || cols_ != B.cols_) {
             throw std::invalid_argument("silu_hadamard: dimension mismatch");
         }
-        num_threads = std::max<std::size_t>(1, num_threads);
+        const std::size_t n = data_.size();
+        if (n == 0) {
+            return;
+        }
         auto worker = [&](std::size_t start, std::size_t end) {
             for (std::size_t i = start; i < end; ++i) {
                 const T z = data_[i];
@@ -364,22 +330,12 @@ public:
             }
         };
 
-        const std::size_t n = data_.size();
-        if (threads && n > 1 && num_threads > 1) {
-            threads->clear();
-            const std::size_t per_thread = (n + num_threads - 1) / num_threads;
-            for (std::size_t t = 0; t < num_threads; ++t) {
-                const std::size_t start = t * per_thread;
-                const std::size_t end = std::min(start + per_thread, n);
-                if (start >= n) break;
-                threads->emplace_back(worker, start, end);
-            }
-            for (auto& thread : *threads) {
-                thread.join();
-            }
-        } else {
-            worker(0, n);
-        }
+        const std::size_t worker_count = std::min(pool.size(), n);
+        const std::size_t per_worker = (n + worker_count - 1) / worker_count;
+        pool.run(worker_count, [&](std::size_t t) {
+            const std::size_t start = t * per_worker;
+            worker(start, std::min(start + per_worker, n));
+        });
     }
 
     // Multiply each row by a (1, cols) row vector
@@ -398,10 +354,12 @@ public:
 
     // Apply a unary function element-wise, returning a new matrix
     template <typename Fn>
-    Mat apply(Fn fn, std::vector<std::thread>* threads = nullptr,
-              std::size_t num_threads = mat_detail::hardware_thread_count()) const {
+    Mat apply(Fn fn, ThreadPool& pool) const {
         Mat result(rows_, cols_);
         const std::size_t n = data_.size();
+        if (n == 0) {
+            return result;
+        }
 
         auto worker = [&](std::size_t start, std::size_t end) {
             for (std::size_t i = start; i < end; ++i) {
@@ -409,22 +367,12 @@ public:
             }
         };
 
-        num_threads = std::max<std::size_t>(1, num_threads);
-        if (threads && n > 1 && num_threads > 1) {
-            threads->clear();
-            const std::size_t per_thread = (n + num_threads - 1) / num_threads;
-            for (std::size_t t = 0; t < num_threads; ++t) {
-                const std::size_t start = t * per_thread;
-                const std::size_t end = std::min(start + per_thread, n);
-                if (start >= n) break;
-                threads->emplace_back(worker, start, end);
-            }
-            for (auto& th : *threads) {
-                th.join();
-            }
-        } else {
-            worker(0, n);
-        }
+        const std::size_t worker_count = std::min(pool.size(), n);
+        const std::size_t per_worker = (n + worker_count - 1) / worker_count;
+        pool.run(worker_count, [&](std::size_t t) {
+            const std::size_t start = t * per_worker;
+            worker(start, std::min(start + per_worker, n));
+        });
 
         return result;
     }

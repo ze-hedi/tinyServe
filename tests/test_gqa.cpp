@@ -71,14 +71,15 @@ TEST(GQATest, MHAMatchesReference) {
     GQA<float> gqa(n_heads, n_kv_heads, head_dim,
                    W_q, W_k, W_v, W_o); // copy, keep originals
 
-    Mat<float> result = gqa.forward(x);
+    ThreadPool pool(4);
+    Mat<float> result = gqa.forward(x, pool);
     ASSERT_EQ(result.rows(), seq_len);
     ASSERT_EQ(result.cols(), d_model);
 
     // Build reference: project, apply RoPE, per-head attention, concat, output proj
-    Mat<float> Q_all = x.matmul(W_q);
-    Mat<float> K_all = x.matmul(W_k);
-    Mat<float> V_all = x.matmul(W_v);
+    Mat<float> Q_all = x.matmul(W_q, pool);
+    Mat<float> K_all = x.matmul(W_k, pool);
+    Mat<float> V_all = x.matmul(W_v, pool);
 
     Mat<float> concat(seq_len, n_heads * head_dim);
     for (std::size_t h = 0; h < n_heads; ++h) {
@@ -90,7 +91,7 @@ TEST(GQATest, MHAMatchesReference) {
         auto attn = ref_causal_attention(Q_h, K_h, V_h, head_dim);
         concat.set_cols(h * head_dim, attn);
     }
-    Mat<float> expected = concat.matmul(W_o);
+    Mat<float> expected = concat.matmul(W_o, pool);
 
     for (std::size_t r = 0; r < seq_len; ++r)
         for (std::size_t c = 0; c < d_model; ++c)
@@ -116,12 +117,13 @@ TEST(GQATest, GQAGroupedMatchesReference) {
     auto x = random_mat(seq_len, d_model, rng);
 
     GQA<float> gqa(n_heads, n_kv_heads, head_dim, W_q, W_k, W_v, W_o);
-    Mat<float> result = gqa.forward(x);
+    ThreadPool pool(4);
+    Mat<float> result = gqa.forward(x, pool);
 
     // Reference with grouped KV sharing + RoPE
-    Mat<float> Q_all = x.matmul(W_q);
-    Mat<float> K_all = x.matmul(W_k);
-    Mat<float> V_all = x.matmul(W_v);
+    Mat<float> Q_all = x.matmul(W_q, pool);
+    Mat<float> K_all = x.matmul(W_k, pool);
+    Mat<float> V_all = x.matmul(W_v, pool);
 
     Mat<float> concat(seq_len, n_heads * head_dim);
     for (std::size_t h = 0; h < n_heads; ++h) {
@@ -134,7 +136,7 @@ TEST(GQATest, GQAGroupedMatchesReference) {
         auto attn = ref_causal_attention(Q_h, K_h, V_h, head_dim);
         concat.set_cols(h * head_dim, attn);
     }
-    Mat<float> expected = concat.matmul(W_o);
+    Mat<float> expected = concat.matmul(W_o, pool);
 
     for (std::size_t r = 0; r < seq_len; ++r)
         for (std::size_t c = 0; c < d_model; ++c)
@@ -158,7 +160,8 @@ TEST(GQATest, OutputShape) {
                    random_mat(d_model, n_kv_heads * head_dim, rng),
                    random_mat(n_heads * head_dim, d_model, rng));
 
-    auto out = gqa.forward(random_mat(seq_len, d_model, rng));
+    ThreadPool pool(4);
+    auto out = gqa.forward(random_mat(seq_len, d_model, rng), pool);
     EXPECT_EQ(out.rows(), seq_len);
     EXPECT_EQ(out.cols(), d_model);
 }

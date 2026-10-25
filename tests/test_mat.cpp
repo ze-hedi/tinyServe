@@ -1,4 +1,5 @@
 #include "mat.h"
+#include "thread_pool.h"
 
 #include <gtest/gtest.h>
 
@@ -90,8 +91,8 @@ TEST(MatTest, SiluHadamardInPlace) {
     Mat<float> gate(2, 3, {-2.0f, -0.5f, 0.0f, 0.5f, 2.0f, 20.0f});
     const Mat<float> up(2, 3, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
     const std::vector<float> original = {-2.0f, -0.5f, 0.0f, 0.5f, 2.0f, 20.0f};
-    std::vector<std::thread> threads;
-    gate.silu_hadamard(up, &threads, 3);
+    ThreadPool pool(3);
+    gate.silu_hadamard(up, pool);
     for (std::size_t r = 0; r < gate.rows(); ++r) {
         for (std::size_t c = 0; c < gate.cols(); ++c) {
             const std::size_t i = r * gate.cols() + c;
@@ -175,7 +176,8 @@ TEST(MatTest, MMapMatmulMatchesIndependentReference) {
         auto b = make_mapped_weight(directory.path(), k, n, b_values);
 
         for (const std::size_t thread_count : {std::size_t{1}, std::size_t{3}, std::size_t{30}}) {
-            const auto actual = a.matmul(b, nullptr, thread_count);
+            ThreadPool pool(thread_count);
+            const auto actual = a.matmul(b, pool);
             for (std::size_t row = 0; row < m; ++row) {
                 for (std::size_t col = 0; col < n; ++col) {
                     double expected = 0.0;
@@ -196,7 +198,8 @@ TEST(MatTest, MMapMatmulPromotesFloatWeightsForDoubleInput) {
     TempMMapDirectory directory;
     const Mat<double> a(2, 3, {1.0, 2.0, 3.0, 4.0, 5.0, 6.0});
     auto b = make_mapped_weight(directory.path(), 3, 2, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
-    const auto result = a.matmul(b, nullptr, 4);
+    ThreadPool pool(4);
+    const auto result = a.matmul(b, pool);
     EXPECT_DOUBLE_EQ(result(0, 0), 22.0);
     EXPECT_DOUBLE_EQ(result(0, 1), 28.0);
     EXPECT_DOUBLE_EQ(result(1, 0), 49.0);

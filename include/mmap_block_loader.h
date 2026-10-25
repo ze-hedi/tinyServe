@@ -222,7 +222,7 @@ inline MMapLlamaBlockWeights load_mapped_llama_block(
         throw std::runtime_error(std::string("mmap loader: invalid shapes.json: ") + error.what());
     }
     if (manifest.at("format") != "tinyserve-float32-matrices" ||
-        manifest.at("format_version") != 1 || manifest.at("layer_index") != 0) {
+        manifest.at("format_version") != 1) {
         throw std::runtime_error("mmap loader: unsupported block manifest format");
     }
 

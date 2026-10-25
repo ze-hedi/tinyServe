@@ -31,6 +31,13 @@ if(TINYSERVE_NATIVE)
     target_compile_options(bench_block_mmap PRIVATE -march=native)
 endif()
 
+add_executable(bench_smollm3_mmap bench_smollm3_mmap.cpp)
+target_include_directories(bench_smollm3_mmap PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_options(bench_smollm3_mmap PRIVATE -O3 -Wall -Wextra -Wpedantic)
+if(TINYSERVE_NATIVE)
+    target_compile_options(bench_smollm3_mmap PRIVATE -march=native)
+endif()
+
 add_executable(tokenizer_test tokenizer_test.cpp)
 target_include_directories(tokenizer_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(tokenizer_test PRIVATE pcre2-8-static)

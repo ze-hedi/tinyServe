@@ -1,4 +1,5 @@
 #include "llama_transformer.h"
+#include "thread_pool.h"
 
 #include <cmath>
 #include <cstddef>
@@ -55,7 +56,8 @@ TEST(MatOpsTest, MulRowVec) {
 
 TEST(MatOpsTest, Apply) {
     Mat<float> a(1, 3, {-1, 0, 2});
-    auto b = a.apply([](float x) { return x * x; });
+    ThreadPool pool(2);
+    auto b = a.apply([](float x) { return x * x; }, pool);
     EXPECT_FLOAT_EQ(b(0, 0), 1);
     EXPECT_FLOAT_EQ(b(0, 1), 0);
     EXPECT_FLOAT_EQ(b(0, 2), 4);
@@ -69,7 +71,8 @@ TEST(RMSNormTest, GammaOnesMatchesManual) {
     Mat<float> x(1, d, {1.0f, 2.0f, 3.0f, 4.0f});
     RMSNorm<float> norm(ones_row(d));
 
-    auto out = norm.forward(x);
+    ThreadPool pool(2);
+    auto out = norm.forward(x, pool);
 
     // rms = sqrt(mean(1+4+9+16) + 1e-6) = sqrt(7.5 + 1e-6)
     float rms = std::sqrt(30.0f / 4.0f + 1e-6f);
@@ -84,7 +87,8 @@ TEST(RMSNormTest, GammaScales) {
     Mat<float> gamma(1, d, {2.0f, 0.5f});
     RMSNorm<float> norm(std::move(gamma));
 
-    auto out = norm.forward(x);
+    ThreadPool pool(2);
+    auto out = norm.forward(x, pool);
     float rms = std::sqrt((9.0f + 16.0f) / 2.0f + 1e-6f);
     EXPECT_NEAR(out(0, 0), (3.0f / rms) * 2.0f, 1e-5f);
     EXPECT_NEAR(out(0, 1), (4.0f / rms) * 0.5f, 1e-5f);
@@ -95,7 +99,8 @@ TEST(RMSNormTest, OutputShape) {
     std::size_t d = 8;
     RMSNorm<float> norm(ones_row(d));
     auto x = random_mat(5, d, rng);
-    auto out = norm.forward(x);
+    ThreadPool pool(2);
+    auto out = norm.forward(x, pool);
     EXPECT_EQ(out.rows(), 5u);
     EXPECT_EQ(out.cols(), d);
 }
@@ -122,7 +127,8 @@ TEST(SwiGLUTest, OutputShape) {
                       random_mat(d_ff, d_model, rng));
 
     auto x = random_mat(seq_len, d_model, rng);
-    auto out = mlp.forward(x);
+    ThreadPool pool(4);
+    auto out = mlp.forward(x, pool);
     EXPECT_EQ(out.rows(), seq_len);
     EXPECT_EQ(out.cols(), d_model);
 }
@@ -137,14 +143,15 @@ TEST(SwiGLUTest, MatchesReference) {
     auto x = random_mat(seq_len, d_model, rng);
 
     SwiGLU<float> mlp(W_gate, W_up, W_down);
-    auto result = mlp.forward(x);
+    ThreadPool pool(4);
+    auto result = mlp.forward(x, pool);
 
     // Reference computation
-    auto gate = x.matmul(W_gate);
-    auto up = x.matmul(W_up);
-    auto activated = gate.apply([](float z) { return z / (1.0f + std::exp(-z)); });
+    auto gate = x.matmul(W_gate, pool);
+    auto up = x.matmul(W_up, pool);
+    auto activated = gate.apply([](float z) { return z / (1.0f + std::exp(-z)); }, pool);
     auto fused = activated.hadamard(up);
-    auto expected = fused.matmul(W_down);
+    auto expected = fused.matmul(W_down, pool);
 
     for (std::size_t r = 0; r < seq_len; ++r)
         for (std::size_t c = 0; c < d_model; ++c)
@@ -170,8 +177,9 @@ TEST(LlamaBlockTest, OutputShape) {
                       random_mat(d_model, d_ff, rng),
                       random_mat(d_ff, d_model, rng));
 
+    ThreadPool pool(4);
     LlamaBlock<float> block(std::move(attn_norm), std::move(attn),
-                            std::move(ffn_norm), std::move(mlp));
+                            std::move(ffn_norm), std::move(mlp), pool);
 
     auto x = random_mat(seq_len, d_model, rng);
     auto out = block.forward(x);
@@ -197,8 +205,9 @@ TEST(LlamaBlockTest, ResidualConnection) {
     RMSNorm<float> ffn_norm(ones_row(d_model));
     SwiGLU<float> mlp(zero(d_model, d_ff), zero(d_model, d_ff), zero(d_ff, d_model));
 
+    ThreadPool pool(4);
     LlamaBlock<float> block(std::move(attn_norm), std::move(attn),
-                            std::move(ffn_norm), std::move(mlp));
+                            std::move(ffn_norm), std::move(mlp), pool);
 
     Mat<float> x(seq_len, d_model, {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12});
     auto out = block.forward(x);
