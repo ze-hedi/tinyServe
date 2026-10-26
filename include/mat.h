@@ -178,10 +178,74 @@ public:
         return result;
     }
 
+    // v(1, k) * B_mmap(k, n) -> C(1, n), parallelized over K.
+    // Each worker owns a private partial output; no atomics or shared writes.
+    Mat vectmat(const MMapWeight& B, ThreadPool& pool) const {
+        if (rows_ != 1) {
+            throw std::invalid_argument("vectmat: left operand must have exactly 1 row");
+        }
+        if (cols_ != B.rows()) {
+            throw std::invalid_argument("vectmat: dimension mismatch");
+        }
+
+        const std::size_t K = cols_;
+        const std::size_t N = B.cols();
+        constexpr std::size_t TJ = 64;
+        constexpr std::size_t TK = 64;
+
+        Mat result(1, N);
+        if (K == 0 || N == 0) {
+            return result;
+        }
+
+        const T* A_ptr = data_.data();
+        const float* B_ptr = B.data();
+        T* C_ptr = result.data_.data();
+        bool use_avx2 = false;
+#if defined(__x86_64__) || defined(__i386__)
+        if constexpr (std::is_same_v<T, float>) {
+            use_avx2 = micro_kernels::has_avx2_fma();
+        }
+#endif
+        const bool aligned_b = reinterpret_cast<std::uintptr_t>(B_ptr) % 32 == 0 && N % 8 == 0;
+        const std::size_t k_tiles = (K + TK - 1) / TK;
+        const std::size_t worker_count = std::min(pool.size(), k_tiles);
+        std::vector<T> partials((worker_count - 1) * N, T{0});
+
+        pool.run(worker_count, [&](std::size_t t) {
+            const std::size_t tile_begin = k_tiles * t / worker_count;
+            const std::size_t tile_end = k_tiles * (t + 1) / worker_count;
+            const std::size_t k_begin = tile_begin * TK;
+            const std::size_t k_limit = std::min(tile_end * TK, K);
+            T* partial = t == 0 ? C_ptr : partials.data() + (t - 1) * N;
+
+            for (std::size_t j0 = 0; j0 < N; j0 += TJ) {
+                const std::size_t j_end = std::min(j0 + TJ, N);
+                for (std::size_t k0 = k_begin; k0 < k_limit; k0 += TK) {
+                    const std::size_t k_end = std::min(k0 + TK, k_limit);
+                    micro_kernels::mmap_matmul_tile(A_ptr, B_ptr, partial, K, N,
+                                                    0, 1, j0, j_end, k0, k_end,
+                                                    use_avx2, aligned_b);
+                }
+            }
+        });
+
+        for (std::size_t t = 1; t < worker_count; ++t) {
+            const T* partial = partials.data() + (t - 1) * N;
+            for (std::size_t j = 0; j < N; ++j) {
+                C_ptr[j] += partial[j];
+            }
+        }
+        return result;
+    }
+
     // A(m, k) * B_mmap(k, n) -> C(m, n)  — same tiling, B is an MMapWeight
     Mat matmul(const MMapWeight& B, ThreadPool& pool) const {
         if (cols_ != B.rows()) {
             throw std::invalid_argument("matmul(MMapWeight): dimension mismatch");
+        }
+        if (rows_ == 1) {
+            return vectmat(B, pool);
         }
 
         const std::size_t M = rows_;

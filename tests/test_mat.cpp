@@ -160,7 +160,8 @@ MMapWeight make_mapped_weight(const std::filesystem::path& directory,
 TEST(MatTest, MMapMatmulMatchesIndependentReference) {
     TempMMapDirectory directory;
     const std::vector<std::array<std::size_t, 3>> shapes = {
-        {1, 1, 1}, {5, 7, 15}, {6, 64, 16}, {7, 65, 17}, {65, 130, 70}
+        {1, 1, 1}, {1, 7, 15}, {1, 64, 16}, {1, 65, 17}, {1, 130, 70},
+        {5, 7, 15}, {6, 64, 16}, {7, 65, 17}, {65, 130, 70}
     };
 
     for (const auto [m, k, n] : shapes) {
@@ -204,6 +205,26 @@ TEST(MatTest, MMapMatmulPromotesFloatWeightsForDoubleInput) {
     EXPECT_DOUBLE_EQ(result(0, 1), 28.0);
     EXPECT_DOUBLE_EQ(result(1, 0), 49.0);
     EXPECT_DOUBLE_EQ(result(1, 1), 64.0);
+}
+
+TEST(MatTest, MMapVectmatPromotesFloatWeightsForDoubleInput) {
+    TempMMapDirectory directory;
+    const Mat<double> a(1, 3, {1.0, 2.0, 3.0});
+    auto b = make_mapped_weight(directory.path(), 3, 2, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
+    ThreadPool pool(4);
+    const auto result = a.vectmat(b, pool);
+    EXPECT_DOUBLE_EQ(result(0, 0), 22.0);
+    EXPECT_DOUBLE_EQ(result(0, 1), 28.0);
+}
+
+TEST(MatTest, MMapVectmatValidatesShape) {
+    TempMMapDirectory directory;
+    auto b = make_mapped_weight(directory.path(), 3, 2, {1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f});
+    const Mat<float> multiple_rows(2, 3);
+    const Mat<float> wrong_inner_dimension(1, 2);
+    ThreadPool pool(2);
+    EXPECT_THROW(multiple_rows.vectmat(b, pool), std::invalid_argument);
+    EXPECT_THROW(wrong_inner_dimension.vectmat(b, pool), std::invalid_argument);
 }
 
 int main(int argc, char** argv) {

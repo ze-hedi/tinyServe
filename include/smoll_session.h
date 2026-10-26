@@ -55,8 +55,8 @@ public:
 
     // Generate the assistant turn: stops after max_new_tokens, when the model closes its turn
     // with <|im_end|> (not included in the result), or when on_token returns false.
-    // on_token sees each token as it is picked, including the closing <|im_end|>; its text can be a partial UTF-8 sequence,
-    // result.text is the reliable decoding.
+    // on_token sees each generated content token; the closing <|im_end|> is consumed internally.
+    // result.text is the reliable decoding (token text can be a partial UTF-8 sequence).
     //
     // The KV cache lives in the session and survives between calls. The cache remembers which
     // token ids it holds; each call re-renders the whole history, keeps the longest prefix
@@ -110,7 +110,6 @@ public:
         while (true) {
             DecodedToken<T> token = decoder.decode_next(logits, tokenizer);
             if (token.token_id == end_of_turn) {
-                if (on_token) on_token(token);  // shown to the caller, but not part of result.ids
                 result.stop = StopReason::EndOfTurn;
                 break;
             }

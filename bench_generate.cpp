@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <string>
 
 // Interactive chat on the terminal: type a message, get the streamed answer, repeat. Every turn
@@ -15,8 +16,6 @@
 // --verify recomputes each turn's last step without cache and checks the cache agrees.
 
 using Clock = std::chrono::steady_clock;
-
-static constexpr std::size_t kMaxNewTokens = 100;
 
 static double ms_since(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -57,7 +56,7 @@ int main(int argc, char* argv[]) {
     try {
         std::string model_root = "smollm3";
         std::string system_prompt = "You are a helpful assistant.";
-        bool thinking = false;
+        bool thinking = true;
         bool verify = false;
         std::size_t threads = mat_detail::hardware_thread_count();
         std::size_t layers = 0;
@@ -98,9 +97,8 @@ int main(int argc, char* argv[]) {
         session.agent().set_thinking(thinking).set_system_prompt(system_prompt);
         Decoder<float> decoder(DecodingStrategy::Greedy);
 
-        std::printf("Chat ready (%s, context %zu tokens, up to %zu new tokens per answer). "
-                    "/help for commands.\n",
-                    thinking ? "/think" : "/no_think", context, kMaxNewTokens);
+        std::printf("Chat ready (%s, context %zu tokens). /help for commands.\n",
+                    thinking ? "/think" : "/no_think", context);
 
         std::string line;
         while (true) {
@@ -143,7 +141,7 @@ int main(int argc, char* argv[]) {
             GenerationResult<float> result;
             try {
                 result = session.generate(
-                    decoder, kMaxNewTokens, [&](const DecodedToken<float>& t) {
+                    decoder, std::numeric_limits<std::size_t>::max(), [&](const DecodedToken<float>& t) {
                         pending += t.text;
                         const std::size_t n = complete_utf8_prefix(pending);
                         std::fwrite(pending.data(), 1, n, stdout);
@@ -163,7 +161,7 @@ int main(int argc, char* argv[]) {
 
             switch (result.stop) {
                 case StopReason::EndOfTurn: break;
-                case StopReason::MaxTokens: std::printf(" [cut at %zu tokens]", kMaxNewTokens); break;
+                case StopReason::MaxTokens: std::printf(" [context full]"); break;
                 case StopReason::Cancelled: std::printf(" [interrupted]"); break;
             }
             std::printf("\n");

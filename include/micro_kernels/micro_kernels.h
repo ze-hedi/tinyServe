@@ -43,6 +43,33 @@ inline void mmap_micro_kernel(
 #if defined(__x86_64__) || defined(__i386__)
 template <bool Aligned>
 __attribute__((target("avx2,fma")))
+inline void mmap_micro_kernel_1x16_avx2(
+        const float* A, const float* B, float* C, std::size_t K,
+        std::size_t ldb) {
+    __m256 c0 = _mm256_loadu_ps(C);
+    __m256 c1 = _mm256_loadu_ps(C + 8);
+
+    for (std::size_t k = 0; k < K; ++k) {
+        __m256 b0;
+        __m256 b1;
+        if constexpr (Aligned) {
+            b0 = _mm256_load_ps(B + k * ldb);
+            b1 = _mm256_load_ps(B + k * ldb + 8);
+        } else {
+            b0 = _mm256_loadu_ps(B + k * ldb);
+            b1 = _mm256_loadu_ps(B + k * ldb + 8);
+        }
+        const __m256 a = _mm256_broadcast_ss(A + k);
+        c0 = _mm256_fmadd_ps(a, b0, c0);
+        c1 = _mm256_fmadd_ps(a, b1, c1);
+    }
+
+    _mm256_storeu_ps(C, c0);
+    _mm256_storeu_ps(C + 8, c1);
+}
+
+template <bool Aligned>
+__attribute__((target("avx2,fma")))
 inline void mmap_micro_kernel_6x16_avx2(
         const float* A, const float* B, float* C, std::size_t K,
         std::size_t lda, std::size_t ldb, std::size_t ldc) {
@@ -122,6 +149,18 @@ inline void mmap_matmul_tile(
             const std::size_t nr = std::min(NR, j_end - j);
 #if defined(__x86_64__) || defined(__i386__)
             if constexpr (std::is_same_v<T, float>) {
+                if (use_avx2 && mr == 1 && nr == NR) {
+                    if (aligned_b) {
+                        mmap_micro_kernel_1x16_avx2<true>(
+                            A + i * K + k0, B + k0 * N + j, C + i * N + j,
+                            k_len, N);
+                    } else {
+                        mmap_micro_kernel_1x16_avx2<false>(
+                            A + i * K + k0, B + k0 * N + j, C + i * N + j,
+                            k_len, N);
+                    }
+                    continue;
+                }
                 if (use_avx2 && mr == MR && nr == NR) {
                     if (aligned_b) {
                         mmap_micro_kernel_6x16_avx2<true>(

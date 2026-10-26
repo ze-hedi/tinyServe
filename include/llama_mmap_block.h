@@ -22,18 +22,19 @@ void apply_rope(Mat<T>& x, float rope_theta, std::size_t pos_offset = 0) {
     if (head_dim % 2 != 0) {
         throw std::invalid_argument("apply_rope: head_dim must be even");
     }
+    const std::size_t half = head_dim / 2;
     for (std::size_t i = 0; i < seq_len; ++i) {
         std::size_t pos = pos_offset + i;
-        for (std::size_t j = 0; j < head_dim / 2; ++j) {
+        for (std::size_t j = 0; j < half; ++j) {
             const float theta = static_cast<float>(pos) /
                 std::pow(rope_theta,
                          static_cast<float>(2 * j) / static_cast<float>(head_dim));
             const float cos_t = std::cos(theta);
             const float sin_t = std::sin(theta);
-            const float x0 = static_cast<float>(x(i, 2 * j));
-            const float x1 = static_cast<float>(x(i, 2 * j + 1));
-            x(i, 2 * j) = static_cast<T>(x0 * cos_t - x1 * sin_t);
-            x(i, 2 * j + 1) = static_cast<T>(x0 * sin_t + x1 * cos_t);
+            const float x0 = static_cast<float>(x(i, j));
+            const float x1 = static_cast<float>(x(i, j + half));
+            x(i, j) = static_cast<T>(x0 * cos_t - x1 * sin_t);
+            x(i, j + half) = static_cast<T>(x0 * sin_t + x1 * cos_t);
         }
     }
 }
@@ -66,10 +67,10 @@ void apply_rope_heads(Mat<T>& x, std::size_t n_heads, std::size_t head_dim,
             for (std::size_t j = 0; j < pairs; ++j) {
                 const float cos_t = cosines[i * pairs + j];
                 const float sin_t = sines[i * pairs + j];
-                const float x0 = static_cast<float>(x(i, offset + 2 * j));
-                const float x1 = static_cast<float>(x(i, offset + 2 * j + 1));
-                x(i, offset + 2 * j) = static_cast<T>(x0 * cos_t - x1 * sin_t);
-                x(i, offset + 2 * j + 1) = static_cast<T>(x0 * sin_t + x1 * cos_t);
+                const float x0 = static_cast<float>(x(i, offset + j));
+                const float x1 = static_cast<float>(x(i, offset + j + pairs));
+                x(i, offset + j) = static_cast<T>(x0 * cos_t - x1 * sin_t);
+                x(i, offset + j + pairs) = static_cast<T>(x0 * sin_t + x1 * cos_t);
             }
         }
     }

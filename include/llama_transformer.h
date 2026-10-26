@@ -12,7 +12,7 @@
 
 // Apply Rotary Position Embeddings (RoPE) in-place to x: (seq_len, head_dim).
 // Each row i corresponds to token at position (pos_offset + i).
-// Pairs of dimensions (2j, 2j+1) are rotated by angle:
+// Pairs of dimensions (j, j + head_dim / 2) are rotated by angle:
 //   theta_j = (pos_offset + i) / 10000^(2j / head_dim)
 template <typename T>
 void apply_rope(Mat<T>& x, std::size_t pos_offset = 0) {
@@ -21,9 +21,10 @@ void apply_rope(Mat<T>& x, std::size_t pos_offset = 0) {
     if (head_dim % 2 != 0) {
         throw std::invalid_argument("apply_rope: head_dim must be even");
     }
+    const std::size_t half = head_dim / 2;
     for (std::size_t i = 0; i < seq_len; ++i) {
         std::size_t pos = pos_offset + i;
-        for (std::size_t j = 0; j < head_dim / 2; ++j) {
+        for (std::size_t j = 0; j < half; ++j) {
             // Compute RoPE in float so low-precision element types (such as
             // BF16) do not narrow constants like 10000 before the calculation.
             const float theta = static_cast<float>(pos) /
@@ -31,10 +32,10 @@ void apply_rope(Mat<T>& x, std::size_t pos_offset = 0) {
                          static_cast<float>(2 * j) / static_cast<float>(head_dim));
             const float cos_t = std::cos(theta);
             const float sin_t = std::sin(theta);
-            const float x0 = static_cast<float>(x(i, 2 * j));
-            const float x1 = static_cast<float>(x(i, 2 * j + 1));
-            x(i, 2 * j) = static_cast<T>(x0 * cos_t - x1 * sin_t);
-            x(i, 2 * j + 1) = static_cast<T>(x0 * sin_t + x1 * cos_t);
+            const float x0 = static_cast<float>(x(i, j));
+            const float x1 = static_cast<float>(x(i, j + half));
+            x(i, j) = static_cast<T>(x0 * cos_t - x1 * sin_t);
+            x(i, j + half) = static_cast<T>(x0 * sin_t + x1 * cos_t);
         }
     }
 }

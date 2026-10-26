@@ -263,6 +263,32 @@ TEST(RoPETest, PreservesNorm) {
     }
 }
 
+TEST(RoPETest, MatchesHuggingFaceRotateHalfLayout) {
+    const std::vector<float> original{1.0f, 2.0f, 3.0f, 4.0f};
+    constexpr std::size_t head_dim = 4;
+    constexpr std::size_t pos = 1;
+    constexpr float theta = 10000.0f;
+    std::vector<float> expected(head_dim);
+    for (std::size_t j = 0; j < head_dim / 2; ++j) {
+        const float angle = static_cast<float>(pos) /
+            std::pow(theta, static_cast<float>(2 * j) / head_dim);
+        expected[j] = original[j] * std::cos(angle) -
+                      original[j + head_dim / 2] * std::sin(angle);
+        expected[j + head_dim / 2] = original[j] * std::sin(angle) +
+                                     original[j + head_dim / 2] * std::cos(angle);
+    }
+
+    Mat<float> single(1, head_dim, original);
+    Mat<float> multi(1, head_dim, original);
+    apply_rope(single, pos);
+    gqa_mmap_detail::apply_rope_heads(multi, 1, head_dim, theta, pos);
+
+    for (std::size_t j = 0; j < head_dim; ++j) {
+        EXPECT_NEAR(single(0, j), expected[j], 1e-6f) << "col=" << j;
+        EXPECT_NEAR(multi(0, j), expected[j], 1e-6f) << "col=" << j;
+    }
+}
+
 TEST(RoPETest, MMapMultiHeadMatchesPerHeadReference) {
     constexpr std::size_t seq_len = 5;
     constexpr std::size_t n_heads = 3;
@@ -278,11 +304,11 @@ TEST(RoPETest, MMapMultiHeadMatchesPerHeadReference) {
     }
     for (std::size_t h = 0; h < n_heads; ++h) {
         auto head = expected.slice_cols(h * head_dim, head_dim);
-        gqa_mmap_detail::apply_rope(head, pos_offset);
+        gqa_mmap_detail::apply_rope(head, 5000000.0f, pos_offset);
         expected.set_cols(h * head_dim, head);
     }
 
-    gqa_mmap_detail::apply_rope_heads(actual, n_heads, head_dim, pos_offset);
+    gqa_mmap_detail::apply_rope_heads(actual, n_heads, head_dim, 5000000.0f, pos_offset);
     for (std::size_t r = 0; r < seq_len; ++r) {
         for (std::size_t c = 0; c < n_heads * head_dim; ++c) {
             EXPECT_NEAR(actual(r, c), expected(r, c), 1e-6f)
