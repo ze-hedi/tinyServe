@@ -1,10 +1,12 @@
 #pragma once
 
 #include "embeddings_mmap.h"
+#include "kv_cache.h"
 #include "llama_mmap_block.h"
 #include "mat.h"
 #include "mmap_block_loader.h"
 #include "thread_pool.h"
+#include "tokenizer.h"
 
 #include <cstddef>
 #include <filesystem>
@@ -25,6 +27,7 @@ public:
         std::size_t head_dim = 128;
         std::size_t d_model = 2048;  // n_heads * head_dim
         std::size_t vocab_size = 49152;
+        float rope_theta = 5000000.0f;
     };
 
     SmolLM3(const std::filesystem::path& root_dir,
@@ -40,7 +43,8 @@ public:
                                                         "final_norm", mmap_options)},
           final_norm_{&final_norm_weights_},
           lm_head_weights_{load_mapped_single_tensor(root_dir, "lm_head.json",
-                                                      "lm_head", mmap_options)} {
+                                                      "lm_head", mmap_options)},
+          tokenizer_{(root_dir / "tokenizer" / "tokenizer.json").string()} {
 
         block_weights_.resize(config_.n_layers);
         blocks_.reserve(config_.n_layers);
@@ -52,9 +56,10 @@ public:
                     "SmolLM3: missing block directory '" + block_dir.string() + "'");
             }
             block_weights_[i] = load_mapped_llama_block(block_dir, mmap_options);
+            bool use_rope = (i % 4 != 3);  // NoPE every 4th layer (3:1 ratio)
             blocks_.push_back(std::make_unique<LlamaBlock_MMap<T>>(
                 config_.n_heads, config_.n_kv_heads, config_.head_dim,
-                block_weights_[i], pool_));
+                block_weights_[i], pool_, config_.rope_theta, use_rope));
         }
     }
 
@@ -63,22 +68,67 @@ public:
 
     // token_ids -> (seq_len, vocab_size) logits
     Mat<T> forward(const std::vector<std::size_t>& token_ids) {
-        // Embedding lookup: token_ids -> (seq_len, d_model)
-        Mat<T> hidden = embedding_.forward(token_ids);
-
-        // Transformer blocks
-        for (std::size_t i = 0; i < blocks_.size(); ++i) {
-            hidden = blocks_[i]->forward(hidden);
-        }
-
-        // Final RMSNorm
-        hidden = final_norm_.forward(hidden, pool_);
-
-        // lm_head projection: (seq_len, d_model) @ (d_model, vocab_size) -> (seq_len, vocab_size)
-        return hidden.matmul(lm_head_weights_, pool_);
+        return lm_head(final_norm_.forward(forward_hidden(token_ids), pool_));
     }
 
+    // Cache sized for `capacity` tokens (prompt + everything that will be generated).
+    KVCache<T> make_kv_cache(std::size_t capacity) const {
+        return KVCache<T>(config_.n_layers, config_.n_kv_heads * config_.head_dim, capacity);
+    }
+
+    // String -> tokenize -> forward -> last-position logits (1, vocab_size)
+    Mat<T> generate_next(const std::string& text) {
+        return next_token_logits(tokenizer_.encode(text));
+    }
+
+    // Without cache: token ids -> forward -> last-position logits (1, vocab_size).
+    Mat<T> next_token_logits(const std::vector<uint32_t>& ids32) {
+        return last_row_logits(forward_hidden(to_positions(ids32)));
+    }
+
+    // With cache: ids are the NEW tokens, placed right after what the cache already holds.
+    //   prefill: empty cache + whole prompt     decode: one token at a time
+    // Returns last-position logits (1, vocab_size) and commits the tokens to the cache.
+    Mat<T> next_token_logits(const std::vector<uint32_t>& ids32, KVCache<T>& cache) {
+        Mat<T> hidden = forward_hidden(to_positions(ids32), &cache);
+        cache.advance(ids32.size());
+        return last_row_logits(hidden);
+    }
+
+    const Tokenizer& tokenizer() const { return tokenizer_; }
+
 private:
+    static std::vector<std::size_t> to_positions(const std::vector<uint32_t>& ids32) {
+        if (ids32.empty()) {
+            throw std::invalid_argument("SmolLM3: cannot run an empty token sequence");
+        }
+        return std::vector<std::size_t>(ids32.begin(), ids32.end());
+    }
+
+    // Embedding + transformer blocks (before the final norm). With a cache, the tokens sit at
+    // positions cache->length() onwards; the caller advances the cache afterwards.
+    Mat<T> forward_hidden(const std::vector<std::size_t>& token_ids,
+                          KVCache<T>* cache = nullptr) {
+        Mat<T> hidden = embedding_.forward(token_ids);
+        for (std::size_t i = 0; i < blocks_.size(); ++i) {
+            hidden = blocks_[i]->forward(hidden, cache, i);
+        }
+        return hidden;
+    }
+
+    // (rows, d_model) normalized -> (rows, vocab_size)
+    Mat<T> lm_head(const Mat<T>& normed) { return normed.matmul(lm_head_weights_, pool_); }
+
+    // Only the last position is needed to pick the next token: norm and project that row alone.
+    Mat<T> last_row_logits(const Mat<T>& hidden) {
+        const std::size_t d = hidden.cols();
+        std::vector<T> row(d);
+        for (std::size_t c = 0; c < d; ++c) {
+            row[c] = hidden(hidden.rows() - 1, c);
+        }
+        return lm_head(final_norm_.forward(Mat<T>(1, d, std::move(row)), pool_));
+    }
+
     Config config_;
     ThreadPool pool_;
 
@@ -94,4 +144,7 @@ private:
     MMapWeight final_norm_weights_;
     RMSNorm_MMap<T> final_norm_;
     MMapWeight lm_head_weights_;
+
+    // Tokenizer
+    Tokenizer tokenizer_;
 };

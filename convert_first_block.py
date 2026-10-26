@@ -256,7 +256,20 @@ def main() -> None:
     )
     print("  lm_head done (tied to embed_tokens, transposed)")
 
-    print(f"Done. Embedding + {num_layers} blocks + final_norm + lm_head written to {output_root}/")
+    # --- Copy tokenizer files ---
+    import shutil
+    snapshot_dir = index_path.parent
+    tokenizer_dir = output_root / "tokenizer"
+    tokenizer_dir.mkdir(parents=True, exist_ok=True)
+    for fname in ("tokenizer.json", "tokenizer_config.json"):
+        src = snapshot_dir / fname
+        if src.is_file():
+            shutil.copy2(src, tokenizer_dir / fname)
+            print(f"  {fname} copied")
+        else:
+            print(f"  {fname} not found in snapshot, skipping")
+
+    print(f"Done. Embedding + {num_layers} blocks + final_norm + lm_head + tokenizer written to {output_root}/")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <fstream>
@@ -30,6 +31,21 @@ public:
             uint32_t token_id = id.get<uint32_t>();
             vocab_[token] = token_id;
             id_to_token_[token_id] = token;
+        }
+
+        // Load added tokens (<|im_start|>, <think>, ...). They live outside model.vocab and
+        // must be matched verbatim in the text before the BPE pre-tokenizer runs.
+        if (j.contains("added_tokens")) {
+            for (auto& tok : j["added_tokens"]) {
+                std::string content = tok["content"].get<std::string>();
+                uint32_t token_id = tok["id"].get<uint32_t>();
+                added_tokens_.push_back({content, token_id});
+                added_to_id_[content] = token_id;
+                id_to_added_[token_id] = content;
+            }
+            // Longest first so that overlapping contents resolve to the longest match.
+            std::sort(added_tokens_.begin(), added_tokens_.end(),
+                      [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
         }
 
         // Load merges: ordered list, rank = index
@@ -63,40 +79,56 @@ public:
     Tokenizer(const Tokenizer&) = delete;
     Tokenizer& operator=(const Tokenizer&) = delete;
 
-    // Encode: string -> token IDs
+    // Encode: string -> token IDs. Added tokens found in the text map straight to their ids.
     std::vector<uint32_t> encode(const std::string& text) const {
         std::vector<uint32_t> ids;
-        auto chunks = pre_tokenize(text);
-
-        for (const auto& chunk : chunks) {
-            // Step 1: byte-level encode
-            std::string encoded = byte_encode(chunk);
-
-            // Step 2: BPE merge
-            auto tokens = bpe(encoded);
-
-            // Step 3: vocab lookup
-            for (const auto& tok : tokens) {
-                auto it = vocab_.find(tok);
-                if (it != vocab_.end()) {
-                    ids.push_back(it->second);
+        std::size_t seg_start = 0;
+        std::size_t i = 0;
+        while (i < text.size()) {
+            if (text[i] == '<') {
+                const auto* hit = match_added_token(text, i);
+                if (hit) {
+                    encode_plain(text.substr(seg_start, i - seg_start), ids);
+                    ids.push_back(hit->second);
+                    i += hit->first.size();
+                    seg_start = i;
+                    continue;
                 }
             }
+            ++i;
         }
-
+        encode_plain(text.substr(seg_start), ids);
         return ids;
     }
 
-    // Decode: token IDs -> string
-    std::string decode(const std::vector<uint32_t>& ids) const {
+    // Decode: token IDs -> string. Added tokens are emitted verbatim unless skip_added is set.
+    std::string decode(const std::vector<uint32_t>& ids, bool skip_added = false) const {
+        std::string out;
         std::string encoded;
         for (uint32_t id : ids) {
+            auto added = id_to_added_.find(id);
+            if (added != id_to_added_.end()) {
+                out += byte_decode(encoded);
+                encoded.clear();
+                if (!skip_added) out += added->second;
+                continue;
+            }
             auto it = id_to_token_.find(id);
             if (it != id_to_token_.end()) {
                 encoded += it->second;
             }
         }
-        return byte_decode(encoded);
+        out += byte_decode(encoded);
+        return out;
+    }
+
+    // Id of an added token such as "<|im_end|>"; throws if the tokenizer doesn't define it.
+    uint32_t added_token_id(const std::string& content) const {
+        auto it = added_to_id_.find(content);
+        if (it == added_to_id_.end()) {
+            throw std::runtime_error("Tokenizer: unknown added token '" + content + "'");
+        }
+        return it->second;
     }
 
     // Pre-tokenize: regex split
@@ -135,6 +167,31 @@ private:
     // Vocab
     std::unordered_map<std::string, uint32_t> vocab_;
     std::unordered_map<uint32_t, std::string> id_to_token_;
+
+    // Added tokens, sorted by descending content length
+    std::vector<std::pair<std::string, uint32_t>> added_tokens_;
+    std::unordered_map<std::string, uint32_t> added_to_id_;
+    std::unordered_map<uint32_t, std::string> id_to_added_;
+
+    const std::pair<std::string, uint32_t>* match_added_token(const std::string& text,
+                                                              std::size_t pos) const {
+        for (const auto& tok : added_tokens_) {
+            if (text.compare(pos, tok.first.size(), tok.first) == 0) return &tok;
+        }
+        return nullptr;
+    }
+
+    // Regex split -> byte-level BPE -> vocab lookup for text with no added tokens in it.
+    void encode_plain(const std::string& text, std::vector<uint32_t>& ids) const {
+        for (const auto& chunk : pre_tokenize(text)) {
+            for (const auto& tok : bpe(byte_encode(chunk))) {
+                auto it = vocab_.find(tok);
+                if (it != vocab_.end()) {
+                    ids.push_back(it->second);
+                }
+            }
+        }
+    }
 
     // BPE merge ranks
     struct PairHash {
