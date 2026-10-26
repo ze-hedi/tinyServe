@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Export all BF16 SmolLM3 transformer blocks from HF cache as row-major float32 bins."""
+"""Export all BF16 SmolLM3 weights from HF cache as row-major float32 bins.
+
+Exports: embedding table, all transformer blocks, final layernorm, and lm_head.
+"""
 
 from __future__ import annotations
 
@@ -129,6 +132,75 @@ def export_block(shards, keys_by_shard: dict[int, set[str]], layer_idx: int,
     (output_dir / "shapes.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
 
 
+def export_single_tensor(shards, keys_by_shard: dict[int, set[str]],
+                         tensor_name: str, output_name: str, kind: str,
+                         output_dir: Path, source: str) -> None:
+    """Export a single top-level tensor (embedding, final_norm, lm_head) to output_dir."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    tensor = None
+    for shard_idx, keys in keys_by_shard.items():
+        if tensor_name in keys:
+            tensor = shards[shard_idx].get_tensor(tensor_name)
+            break
+    if tensor is None:
+        raise ValueError(f"Missing tensor in checkpoint: {tensor_name}")
+
+    if tensor.dtype != torch.bfloat16:
+        raise ValueError(f"Expected {tensor_name} to be BF16, got {tensor.dtype}")
+
+    source_shape = list(tensor.shape)
+
+    if kind == "vector":
+        if tensor.ndim != 1:
+            raise ValueError(f"Expected {tensor_name} to be a vector, got shape {source_shape}")
+        tensor = tensor.reshape(1, -1)
+        transposed = False
+    elif kind == "matrix":
+        # Keep as-is (e.g. embedding: vocab_size x embed_dim, already row-major friendly)
+        if tensor.ndim != 2:
+            raise ValueError(f"Expected {tensor_name} to be a matrix, got shape {source_shape}")
+        transposed = False
+    else:  # "linear" — transpose for row-major x @ W convention
+        if tensor.ndim != 2:
+            raise ValueError(f"Expected {tensor_name} to be a matrix, got shape {source_shape}")
+        tensor = tensor.transpose(0, 1)
+        transposed = True
+
+    array = tensor.to(torch.float32).contiguous().numpy()
+    array = np.asarray(array, dtype=np.dtype("<f4"), order="C")
+    filename = f"{output_name}.bin"
+    array.tofile(output_dir / filename)
+
+    info = {
+        "name": output_name,
+        "file": filename,
+        "shape": list(array.shape),
+        "dtype": "float32",
+        "byte_order": "little-endian",
+        "layout": "row-major",
+        "source_tensor": tensor_name,
+        "source_shape": source_shape,
+        "transposed_from_source": transposed,
+        "size_bytes": array.nbytes,
+    }
+
+    # For embedding, add vocab_size and embed_dim for convenience
+    if output_name == "embed_tokens":
+        info["vocab_size"] = array.shape[0]
+        info["embed_dim"] = array.shape[1]
+
+    manifest = {
+        "format": "tinyserve-float32-matrices",
+        "format_version": 1,
+        "source_checkpoint": source,
+        "tensor": info,
+    }
+    (output_dir / f"{output_name}.json").write_text(
+        json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+    )
+
+
 def main() -> None:
     shard_paths, index_path = find_safetensors()
     print(f"Found {len(shard_paths)} shard(s):")
@@ -148,15 +220,43 @@ def main() -> None:
 
     num_layers = detect_layer_count(all_keys)
     output_root = Path("smollm3")
-    print(f"Detected {num_layers} transformer layers, exporting all blocks to {output_root}/")
+    print(f"Detected {num_layers} transformer layers, exporting to {output_root}/")
 
     source = str(index_path.parent)
+
+    # --- Export embedding table ---
+    export_single_tensor(
+        opened, keys_by_shard, "model.embed_tokens.weight",
+        "embed_tokens", "matrix",
+        output_root, source,
+    )
+    print("  embed_tokens done")
+
+    # --- Export transformer blocks ---
     for idx in range(num_layers):
         block_dir = output_root / f"bloc_{idx}"
         export_block(opened, keys_by_shard, idx, block_dir, source)
         print(f"  bloc_{idx} done")
 
-    print(f"Done. {num_layers} blocks written to {output_root}/")
+    # --- Export final layernorm ---
+    export_single_tensor(
+        opened, keys_by_shard, "model.norm.weight",
+        "final_norm", "vector",
+        output_root, source,
+    )
+    print("  final_norm done")
+
+    # lm_head is tied to embed_tokens (tie_word_embeddings=true).
+    # Export the same weight transposed as lm_head for the output projection:
+    # embed_tokens is (vocab_size, d_model), lm_head needs (d_model, vocab_size).
+    export_single_tensor(
+        opened, keys_by_shard, "model.embed_tokens.weight",
+        "lm_head", "linear",
+        output_root, source,
+    )
+    print("  lm_head done (tied to embed_tokens, transposed)")
+
+    print(f"Done. Embedding + {num_layers} blocks + final_norm + lm_head written to {output_root}/")
 
 
 if __name__ == "__main__":

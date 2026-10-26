@@ -206,6 +206,40 @@ struct MMapLlamaBlockWeights {
     MMapWeight down_proj;
 };
 
+// Load a single tensor from a standalone JSON manifest (has "tensor" object, not "tensors" array).
+// The JSON file and .bin file are both expected to be in `directory`.
+inline MMapWeight load_mapped_single_tensor(
+        const std::filesystem::path& directory,
+        const std::string& json_filename,
+        const std::string& tensor_name,
+        const MMapLoadOptions& options = {}) {
+    const auto manifest_path = directory / json_filename;
+    std::ifstream manifest_file(manifest_path);
+    if (!manifest_file) {
+        throw std::runtime_error("mmap loader: cannot open '" + manifest_path.string() + "'");
+    }
+
+    nlohmann::json manifest;
+    try {
+        manifest = nlohmann::json::parse(manifest_file);
+    } catch (const nlohmann::json::exception& error) {
+        throw std::runtime_error(
+            std::string("mmap loader: invalid JSON in ") + json_filename + ": " + error.what());
+    }
+    if (manifest.at("format") != "tinyserve-float32-matrices" ||
+        manifest.at("format_version") != 1) {
+        throw std::runtime_error("mmap loader: unsupported manifest format in " + json_filename);
+    }
+
+    // Wrap the single "tensor" entry into a "tensors" array so MMapWeight::load() can parse it.
+    nlohmann::json wrapped;
+    wrapped["tensors"] = nlohmann::json::array({manifest.at("tensor")});
+
+    MMapWeight w;
+    w.load(directory, wrapped, tensor_name, options);
+    return w;
+}
+
 inline MMapLlamaBlockWeights load_mapped_llama_block(
         const std::filesystem::path& directory,
         const MMapLoadOptions& options = {}) {

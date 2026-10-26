@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <iostream>
 #include <type_traits>
 
 #if defined(__x86_64__) || defined(__i386__)
@@ -97,8 +98,11 @@ inline void mmap_micro_kernel_6x16_avx2(
 }
 
 inline bool has_avx2_fma() {
-    static const bool supported = __builtin_cpu_supports("avx2") &&
-                                  __builtin_cpu_supports("fma");
+    static const bool supported = [] {
+        bool s = __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+        std::cout << "[micro_kernels] AVX2+FMA: " << (s ? "YES" : "NO") << std::endl;
+        return s;
+    }();
     return supported;
 }
 #endif

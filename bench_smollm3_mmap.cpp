@@ -157,7 +157,12 @@ int main(int argc, char* argv[]) {
         const double load_ms = std::chrono::duration<double, std::milli>(load_end - load_start).count();
 
         std::mt19937 rng(42);
-        const auto x = random_mat(options.seq_len, config.d_model, rng);
+        // Generate random token IDs for the sequence
+        std::uniform_int_distribution<std::size_t> token_dist(0, config.vocab_size - 1);
+        std::vector<std::size_t> token_ids(options.seq_len);
+        for (auto& id : token_ids) {
+            id = token_dist(rng);
+        }
 
         std::printf(
             "config: layers=%zu d_model=%zu heads=%zu kv_heads=%zu head_dim=%zu seq=%zu "
@@ -172,7 +177,7 @@ int main(int argc, char* argv[]) {
         Mat<float> out(0, 0);
         for (std::size_t i = 0; i < options.warmup; ++i) {
             const auto start = Clock::now();
-            out = model.forward(x);
+            out = model.forward(token_ids);
             const auto end = Clock::now();
             const double ms = std::chrono::duration<double, std::milli>(end - start).count();
             std::printf("warmup[%zu]: %.3f ms checksum=%.9g\n", i, ms, checksum(out));
@@ -183,7 +188,7 @@ int main(int argc, char* argv[]) {
         for (std::size_t i = 0; i < options.iterations; ++i) {
             const auto faults_before = faults();
             const auto start = Clock::now();
-            out = model.forward(x);
+            out = model.forward(token_ids);
             const auto end = Clock::now();
             const auto faults_after = faults();
             const double ms = std::chrono::duration<double, std::milli>(end - start).count();
@@ -223,10 +228,22 @@ int main(int argc, char* argv[]) {
                                   copy_weight(weights.down_proj)),
                     pool));
             }
-            Mat<float> expected = reference_blocks[0]->forward(x);
-            for (std::size_t layer = 1; layer < reference_blocks.size(); ++layer) {
+            // Replicate the full pipeline: embed -> blocks -> final_norm -> lm_head
+            const auto& root_path = std::filesystem::path(options.model_root);
+            auto embed_w = load_mapped_single_tensor(root_path, "embed_tokens.json",
+                                                     "embed_tokens", options.mmap_options);
+            Embedding_MMap<float> ref_embed(&embed_w);
+            Mat<float> expected = ref_embed.forward(token_ids);
+            for (std::size_t layer = 0; layer < reference_blocks.size(); ++layer) {
                 expected = reference_blocks[layer]->forward(expected);
             }
+            auto fnorm_w = load_mapped_single_tensor(root_path, "final_norm.json",
+                                                     "final_norm", options.mmap_options);
+            RMSNorm_MMap<float> ref_norm(&fnorm_w);
+            expected = ref_norm.forward(expected, pool);
+            auto lmhead_w = load_mapped_single_tensor(root_path, "lm_head.json",
+                                                      "lm_head", options.mmap_options);
+            expected = expected.matmul(lmhead_w, pool);
             double max_abs_error = 0.0;
             double max_relative_error = 0.0;
             for (std::size_t r = 0; r < out.rows(); ++r) {

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "embeddings_mmap.h"
 #include "llama_mmap_block.h"
 #include "mat.h"
 #include "mmap_block_loader.h"
@@ -12,9 +13,8 @@
 #include <string>
 #include <vector>
 
-// SmolLM3 model: a stack of LLaMA-style mmap transformer blocks.
-// Loads all bloc_0/ .. bloc_{N-1}/ from a root directory and chains forward passes.
-// For now this only handles the transformer blocks (no embedding, final norm, or lm_head).
+// SmolLM3 model: embedding + transformer blocks + final norm + lm_head.
+// Loads all weights from a root directory via mmap.
 template <typename T>
 class SmolLM3 {
 public:
@@ -24,6 +24,7 @@ public:
         std::size_t n_kv_heads = 4;
         std::size_t head_dim = 128;
         std::size_t d_model = 2048;  // n_heads * head_dim
+        std::size_t vocab_size = 49152;
     };
 
     SmolLM3(const std::filesystem::path& root_dir,
@@ -31,7 +32,15 @@ public:
             const MMapLoadOptions& mmap_options = {},
             std::size_t num_threads = mat_detail::hardware_thread_count())
         : config_{config},
-          pool_{std::max<std::size_t>(1, num_threads)} {
+          pool_{std::max<std::size_t>(1, num_threads)},
+          embed_weights_{load_mapped_single_tensor(root_dir, "embed_tokens.json",
+                                                   "embed_tokens", mmap_options)},
+          embedding_{&embed_weights_},
+          final_norm_weights_{load_mapped_single_tensor(root_dir, "final_norm.json",
+                                                        "final_norm", mmap_options)},
+          final_norm_{&final_norm_weights_},
+          lm_head_weights_{load_mapped_single_tensor(root_dir, "lm_head.json",
+                                                      "lm_head", mmap_options)} {
 
         block_weights_.resize(config_.n_layers);
         blocks_.reserve(config_.n_layers);
@@ -52,22 +61,37 @@ public:
     const Config& config() const { return config_; }
     std::size_t n_layers() const { return config_.n_layers; }
 
-    // x: (seq_len, d_model) -> (seq_len, d_model)
-    // Passes input through all transformer blocks sequentially.
-    Mat<T> forward(const Mat<T>& x) {
-        if (x.cols() != config_.d_model) {
-            throw std::invalid_argument("SmolLM3: input cols must equal d_model");
-        }
-        Mat<T> hidden = blocks_[0]->forward(x);
-        for (std::size_t i = 1; i < blocks_.size(); ++i) {
+    // token_ids -> (seq_len, vocab_size) logits
+    Mat<T> forward(const std::vector<std::size_t>& token_ids) {
+        // Embedding lookup: token_ids -> (seq_len, d_model)
+        Mat<T> hidden = embedding_.forward(token_ids);
+
+        // Transformer blocks
+        for (std::size_t i = 0; i < blocks_.size(); ++i) {
             hidden = blocks_[i]->forward(hidden);
         }
-        return hidden;
+
+        // Final RMSNorm
+        hidden = final_norm_.forward(hidden, pool_);
+
+        // lm_head projection: (seq_len, d_model) @ (d_model, vocab_size) -> (seq_len, vocab_size)
+        return hidden.matmul(lm_head_weights_, pool_);
     }
 
 private:
     Config config_;
     ThreadPool pool_;
+
+    // Embedding
+    MMapWeight embed_weights_;
+    Embedding_MMap<T> embedding_;
+
+    // Transformer blocks
     std::vector<MMapLlamaBlockWeights> block_weights_;
     std::vector<std::unique_ptr<LlamaBlock_MMap<T>>> blocks_;
+
+    // Final norm + lm_head
+    MMapWeight final_norm_weights_;
+    RMSNorm_MMap<T> final_norm_;
+    MMapWeight lm_head_weights_;
 };
