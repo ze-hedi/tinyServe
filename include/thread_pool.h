@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <condition_variable>
 #include <cstddef>
 #include <functional>
@@ -7,6 +8,11 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(__linux__)
+#include <pthread.h>
+#include <sched.h>
+#endif
 
 // Persistent fork/join worker pool.
 //
@@ -18,15 +24,25 @@
 // thread waits (it does not execute tasks itself), matching the previous
 // spawn-num_threads-and-join semantics.
 //
+// Each worker is pinned to one logical CPU (worker i -> i-th CPU of the
+// process's allowed affinity mask, wrapping around if there are more workers
+// than CPUs). Pinning is best-effort: it is Linux-only and silently skipped if
+// the affinity calls fail.
+//
 // Contract: run() must be called from a single thread at a time (fork/join,
 // not nested). All state below is guarded by mutex_.
 class ThreadPool {
 public:
     explicit ThreadPool(std::size_t workers)
         : workers_{std::max<std::size_t>(1, workers)} {
+        const std::vector<int> cpus = allowed_cpus();
         threads_.reserve(workers_);
         for (std::size_t i = 0; i < workers_; ++i) {
-            threads_.emplace_back([this] { worker_loop(); });
+            const int cpu = cpus.empty() ? -1 : cpus[i % cpus.size()];
+            threads_.emplace_back([this, cpu] {
+                pin_current_thread(cpu);
+                worker_loop();
+            });
         }
     }
 
@@ -69,6 +85,38 @@ public:
     }
 
 private:
+    // Logical CPUs this process may run on, in increasing order.
+    static std::vector<int> allowed_cpus() {
+        std::vector<int> cpus;
+#if defined(__linux__)
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+            for (int c = 0; c < CPU_SETSIZE; ++c) {
+                if (CPU_ISSET(c, &set)) {
+                    cpus.push_back(c);
+                }
+            }
+        }
+#endif
+        return cpus;
+    }
+
+    // Best-effort: pin the calling thread to a single logical CPU.
+    static void pin_current_thread(int cpu) {
+#if defined(__linux__)
+        if (cpu < 0) {
+            return;
+        }
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(cpu, &set);
+        (void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+#else
+        (void)cpu;
+#endif
+    }
+
     void worker_loop() {
         std::unique_lock<std::mutex> lock(mutex_);
         std::size_t generation = 0;

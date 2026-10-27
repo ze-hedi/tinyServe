@@ -63,6 +63,8 @@ if(TINYSERVE_NATIVE)
     target_compile_options(bench_generate PRIVATE -march=native)
 endif()
 
+add_subdirectory(tui)
+
 add_executable(example_chat_context example_chat_context.cpp)
 target_include_directories(example_chat_context PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(example_chat_context PRIVATE pcre2-8-static)

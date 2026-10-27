@@ -1,0 +1,7 @@
+add_executable(tui_chat main.cpp)
+target_include_directories(tui_chat PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(tui_chat PRIVATE pcre2-8-static)
+target_compile_options(tui_chat PRIVATE -O3 -Wall -Wextra -Wpedantic)
+if(TINYSERVE_NATIVE)
+    target_compile_options(tui_chat PRIVATE -march=native)
+endif()
