@@ -10,6 +10,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <vector>
 
 // Interactive chat on the terminal: type a message, get the streamed answer, repeat. Every turn
 // is added to the history and the KV cache is kept, so only the new messages are prefilled.
@@ -47,6 +48,108 @@ static std::size_t complete_utf8_prefix(const std::string& s) {
     return (back + 1 < need) ? i - 1 : s.size();
 }
 
+// Default system prompt: tells the model when to call web_search and when to answer directly.
+// The tool list itself is appended by ChatTemplate (### Tools), so there is no {TOOLS} slot here.
+// NOTE: ChatTemplate treats any "/think" substring in the system prompt as a reasoning-mode
+// switch (and strips it), so this text must not contain the closing think tag literally.
+static constexpr const char* kDefaultSystemPrompt =
+    R"PROMPT(You are an assistant that can use tools.
+
+For every user message, do exactly two steps:
+
+STEP 1 - Think (in your think section):
+- What does the user want?
+- Can I answer correctly from what I already know, without any tool?
+- If not, which ONE tool gives me the missing information, and with which arguments?
+
+Use a tool ONLY if:
+- the answer needs live, recent, or personal data (weather, prices, files, search, etc.), OR
+- the task needs an action the tool performs (calculate, run code, send, read a file).
+Do NOT use a tool for greetings, general knowledge, explanations, or opinions.
+
+STEP 2 - Output. Choose exactly ONE of these two forms:
+
+Form A - a tool is needed:
+Output ONLY the tool call, nothing before or after it:
+<tool_call>{"name": "TOOL_NAME", "arguments": {...}}</tool_call>
+
+Form B - no tool is needed:
+Output ONLY the final answer, in plain text.
+
+Strict rules:
+- Never write text outside the think section and the tool call when using Form A.
+- Never invent a tool name. Only use the tools listed in the Tools section below.
+- Arguments must be valid JSON and match the tool's parameters exactly.
+- One tool call per turn. After the tool call, stop and wait for the result.
+- When you receive a tool result, use it to write the final answer (Form B), or call another tool only if the result is not enough.
+
+Examples:
+
+User: What's the weather in Lyon right now?
+(think: current weather cannot be known without a tool; web_search gives it.)
+<tool_call>{"name": "web_search", "arguments": {"search_query": "weather in Lyon right now"}}</tool_call>
+
+User: What is the capital of Italy?
+(think: general knowledge, no tool needed.)
+The capital of Italy is Rome.
+
+User: Thanks!
+(think: just a thank you, no tool needed.)
+You're welcome!)PROMPT";
+
+// Prints text inside a frame of '*' (top, bottom, left, right), word-wrapped to `width` columns.
+// Columns are counted in UTF-8 characters, not bytes.
+static void print_boxed(const std::string& text, std::size_t width = 100) {
+    const std::size_t inner = width - 4;  // "* " + content + " *"
+
+    auto chars_of = [](const std::string& s) {
+        std::vector<std::string> out;
+        for (std::size_t i = 0; i < s.size();) {
+            const unsigned char c = static_cast<unsigned char>(s[i]);
+            std::size_t len = 1;
+            if ((c & 0xE0) == 0xC0) len = 2;
+            else if ((c & 0xF0) == 0xE0) len = 3;
+            else if ((c & 0xF8) == 0xF0) len = 4;
+            out.push_back(s.substr(i, len));
+            i += len;
+        }
+        return out;
+    };
+
+    std::vector<std::vector<std::string>> rows;  // each row: at most `inner` characters
+    std::size_t start = 0;
+    while (start <= text.size()) {
+        std::size_t end = text.find('\n', start);
+        if (end == std::string::npos) end = text.size();
+        const auto line = chars_of(text.substr(start, end - start));
+        start = end + 1;
+
+        std::size_t pos = 0;
+        if (line.empty()) rows.emplace_back();
+        while (pos < line.size()) {
+            std::size_t stop = pos + inner;
+            if (stop >= line.size()) {
+                stop = line.size();
+            } else {
+                std::size_t brk = stop;  // last space inside the window, else hard break
+                while (brk > pos && line[brk - 1] != " ") --brk;
+                if (brk > pos) stop = brk;
+            }
+            rows.emplace_back(line.begin() + pos, line.begin() + stop);
+            pos = stop;
+        }
+    }
+
+    const std::string border(width, '*');
+    std::printf("%s\n", border.c_str());
+    for (const auto& row : rows) {
+        std::string content;
+        for (const auto& ch : row) content += ch;
+        std::printf("* %s%*s *\n", content.c_str(), static_cast<int>(inner - row.size()), "");
+    }
+    std::printf("%s\n", border.c_str());
+}
+
 static void print_banner() {
     std::printf(R"(
   _   _                 ____
@@ -73,7 +176,7 @@ static void print_help() {
 int main(int argc, char* argv[]) {
     try {
         std::string model_root = "smollm3";
-        std::string system_prompt = "You are a helpful assistant.";
+        std::string system_prompt = kDefaultSystemPrompt;
         bool thinking = true;
         bool verify = false;
         std::size_t threads = mat_detail::default_thread_count();
@@ -129,7 +232,8 @@ int main(int argc, char* argv[]) {
         }});
         Decoder<float> decoder(DecodingStrategy::Greedy);
 
-        std::printf("\nSystem prompt:\n%s\n", session.agent().prompt(false).c_str());
+        std::printf("\nSystem prompt:\n");
+        print_boxed(session.agent().prompt(false));
         std::printf("Chat ready (context %zu tokens). /help for commands.\n", context);
 
         std::string line;
@@ -158,7 +262,7 @@ int main(int argc, char* argv[]) {
                     session.agent().set_thinking(line == "/think");
                     std::printf("(%s)\n", line.c_str());
                 } else if (line == "/show") {
-                    std::printf("%s", session.agent().prompt(false).c_str());
+                    print_boxed(session.agent().prompt(false));
                 } else {
                     std::printf("unknown command, /help lists them\n");
                 }
