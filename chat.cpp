@@ -153,6 +153,8 @@ static void print_boxed(const std::string& text, std::size_t width = 100) {
     std::printf("%s\n", border.c_str());
 }
 
+constexpr const char* kVersion = "0.1";
+
 static void print_banner() {
     std::printf(R"(
   _   _                 ____
@@ -161,8 +163,8 @@ static void print_banner() {
  | |_| | | | | |_| |    ___) |  __/ |   \ V /  __/
   \__|_|_| |_|\__, |   |____/ \___|_|    \_/ \___|
               |___/
-
 )");
+    std::printf("            version %s\n\n", kVersion);
     std::fflush(stdout);
 }
 
