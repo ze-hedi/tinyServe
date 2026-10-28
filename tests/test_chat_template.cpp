@@ -41,7 +41,11 @@ TEST(ChatTemplate, MatchesHuggingFaceGolden) {
         chat::ChatTemplate tmpl([&] { return date; });
         tmpl.set_thinking(c["thinking"].get<bool>());
         if (!c["system"].is_null()) tmpl.set_system_prompt(c["system"].get<std::string>());
-        tmpl.set_tools(c["tools"].get<std::vector<std::string>>());
+        std::vector<chat::Tool> tools;
+        for (const auto& definition : c["tools"].get<std::vector<std::string>>()) {
+            tools.push_back({"", definition, ""});
+        }
+        tmpl.set_tools(std::move(tools));
 
         std::vector<chat::Message> msgs;
         for (auto& m : c["messages"]) {
@@ -53,6 +57,37 @@ TEST(ChatTemplate, MatchesHuggingFaceGolden) {
         const auto ids = tokenizer().encode(rendered);
         EXPECT_EQ(ids, c["ids"].get<std::vector<uint32_t>>()) << "case: " << name;
     }
+}
+
+TEST(ChatTemplate, RendersToolPromptSnippets) {
+    chat::ChatTemplate tmpl([] { return "01 January 2025"; });
+    tmpl.set_thinking(false);
+    tmpl.set_tools({{"get_weather", "{'type': 'function', 'function': {'name': 'get_weather'}}",
+                     "Use this tool when the user asks about current weather."}});
+
+    const std::string rendered = tmpl.render({}, false);
+    const std::size_t tools = rendered.find("### Tools\n\n");
+    ASSERT_NE(tools, std::string::npos);
+    EXPECT_EQ(rendered.substr(tools), R"(### Tools
+
+#### get_weather
+
+Use this tool when the user asks about current weather.
+
+You may call one or more functions to assist with the user query.
+You are provided with function signatures within <tools></tools> XML tags:
+
+<tools>
+{'type': 'function', 'function': {'name': 'get_weather'}}
+</tools>
+
+For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
+<tool_call>
+{"name": <function-name>, "arguments": <args-json-object>}
+</tool_call>
+
+<|im_end|>
+)");
 }
 
 TEST(Tokenizer, EncodesAddedTokensAsSingleIds) {

@@ -25,6 +25,12 @@ struct Message {
     std::string content;
 };
 
+struct Tool {
+    std::string name;
+    std::string definition;
+    std::string prompt_snippet;
+};
+
 inline constexpr const char* kImStart = "<|im_start|>";
 inline constexpr const char* kImEnd = "<|im_end|>";
 
@@ -43,10 +49,11 @@ public:
         return *this;
     }
 
-    // Each entry is one tool already serialized to a single line. HF renders a tool dict with
+    // definition is the tool already serialized to a single line. HF renders a tool dict with
     // Jinja's `string` filter, i.e. a Python repr ({'type': 'function', ...}); the model saw that
-    // form in training, so callers should pass the same form.
-    ChatTemplate& set_tools(std::vector<std::string> tools) {
+    // form in training, so callers should pass the same form. prompt_snippet is additional guidance
+    // rendered under the tool's name in the system prompt.
+    ChatTemplate& set_tools(std::vector<Tool> tools) {
         tools_ = std::move(tools);
         return *this;
     }
@@ -93,7 +100,7 @@ private:
     DateFn date_fn_;
     std::string system_;
     bool has_system_ = false;
-    std::vector<std::string> tools_;
+    std::vector<Tool> tools_;
     bool thinking_ = true;
 
     static std::string default_date() {
@@ -167,10 +174,14 @@ private:
         // model was trained on this exact rendering.
         if (!tools_.empty()) {
             out += "### Tools\n\n";
+            for (const auto& tool : tools_) {
+                if (tool.prompt_snippet.empty()) continue;
+                out += "#### " + tool.name + "\n\n" + tool.prompt_snippet + "\n\n";
+            }
             out += "You may call one or more functions to assist with the user query.\n"
                    "You are provided with function signatures within <tools></tools> XML tags:\n\n"
                    "<tools>\n";
-            for (const auto& t : tools_) out += t + "\n";
+            for (const auto& tool : tools_) out += tool.definition + "\n";
             out += "</tools>\n\n"
                    "For each function call, return a json object with function name and arguments "
                    "within <tool_call></tool_call> XML tags:\n"

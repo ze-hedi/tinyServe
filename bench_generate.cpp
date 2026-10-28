@@ -9,6 +9,7 @@
 #include <iostream>
 #include <limits>
 #include <string>
+#include <string_view>
 
 // Interactive chat on the terminal: type a message, get the streamed answer, repeat. Every turn
 // is added to the history and the KV cache is kept, so only the new messages are prefilled.
@@ -16,6 +17,10 @@
 // --verify recomputes each turn's last step without cache and checks the cache agrees.
 
 using Clock = std::chrono::steady_clock;
+
+constexpr const char* kBlue = "\033[34m";
+constexpr const char* kRed = "\033[31m";
+constexpr const char* kReset = "\033[0m";
 
 static double ms_since(Clock::time_point start) {
     return std::chrono::duration<double, std::milli>(Clock::now() - start).count();
@@ -40,6 +45,19 @@ static std::size_t complete_utf8_prefix(const std::string& s) {
     else if ((lead & 0xF0) == 0xE0) need = 3;
     else if ((lead & 0xF8) == 0xF0) need = 4;
     return (back + 1 < need) ? i - 1 : s.size();
+}
+
+static void print_banner() {
+    std::printf(R"(
+  _   _                 ____
+ | |_(_)_ __  _   _    / ___|  ___ _ ____   _____
+ | __| | '_ \| | | |   \___ \ / _ \ '__\ \ / / _ \
+ | |_| | | | | |_| |    ___) |  __/ |   \ V /  __/
+  \__|_|_| |_|\__, |   |____/ \___|_|    \_/ \___|
+              |___/
+
+)");
+    std::fflush(stdout);
 }
 
 static void print_help() {
@@ -92,6 +110,7 @@ int main(int argc, char* argv[]) {
         SmolLM3<float>::Config config;
         if (layers != 0) config.n_layers = layers;
 
+        print_banner();
         std::printf("Loading model from '%s' (%zu threads)...\n", model_root.c_str(), threads);
         auto load_start = Clock::now();
         SmolLM3<float> model(model_root, config, {}, threads);
@@ -100,16 +119,28 @@ int main(int argc, char* argv[]) {
         SmollSession<float> session(model);
         session.set_context_tokens(context);
         session.agent().set_thinking(thinking).set_system_prompt(system_prompt);
+        session.agent().set_tools({{
+            .name = "web_search",
+            .definition =
+                R"({'type': 'function', 'function': {'name': 'web_search', 'description': 'Search the web for current information', 'parameters': {'type': 'object', 'properties': {'search_query': {'type': 'string', 'description': 'The search query'}}, 'required': ['search_query']}}})",
+            .prompt_snippet =
+                "Use this tool when current information or a web search is needed. "
+                "Provide the search text in the search_query argument.",
+        }});
         Decoder<float> decoder(DecodingStrategy::Greedy);
 
-        std::printf("Chat ready (%s, context %zu tokens). /help for commands.\n",
-                    thinking ? "/think" : "/no_think", context);
+        std::printf("\nSystem prompt:\n%s\n", session.agent().prompt(false).c_str());
+        std::printf("Chat ready (context %zu tokens). /help for commands.\n", context);
 
         std::string line;
         while (true) {
-            std::printf("\nyou> ");
+            std::printf("\nyou> %s", kBlue);
             std::fflush(stdout);
-            if (!std::getline(std::cin, line)) break;  // EOF
+            if (!std::getline(std::cin, line)) {
+                std::printf("%s", kReset);
+                break;  // EOF
+            }
+            std::printf("%s", kReset);
             if (line.empty()) continue;
 
             if (line.starts_with("/")) {
@@ -140,29 +171,69 @@ int main(int argc, char* argv[]) {
 
             g_interrupted = 0;
             std::signal(SIGINT, on_sigint);  // only while generating: at the prompt it exits
-            std::string pending;             // streamed text not printed yet (partial UTF-8)
+            std::string pending;             // streamed text not printed yet (partial UTF-8 or tag)
+            bool thinking_text = false;
+            auto print_text = [&](std::size_t limit = std::numeric_limits<std::size_t>::max()) {
+                const std::size_t complete = complete_utf8_prefix(pending);
+                const std::size_t n = complete < limit ? complete : limit;
+                if (n != 0) {
+                    std::fputs(thinking_text ? kRed : kBlue, stdout);
+                    std::fwrite(pending.data(), 1, n, stdout);
+                    std::fflush(stdout);
+                    pending.erase(0, n);
+                }
+            };
+            auto stream_text = [&](const std::string& text) {
+                pending += text;
+                while (!pending.empty()) {
+                    const std::size_t tag = pending.find('<');
+                    if (tag == std::string::npos) {
+                        print_text();
+                        break;
+                    }
+                    if (tag != 0) {
+                        print_text(tag);
+                        continue;
+                    }
+
+                    constexpr std::string_view open = "<think>";
+                    constexpr std::string_view close = "</think>";
+                    if (pending.starts_with(open)) {
+                        pending.erase(0, open.size());
+                        thinking_text = true;
+                    } else if (pending.starts_with(close)) {
+                        pending.erase(0, close.size());
+                        thinking_text = false;
+                    } else if (open.starts_with(pending) || close.starts_with(pending)) {
+                        break;  // wait for the rest of a split tag
+                    } else {
+                        std::fputs(thinking_text ? kRed : kBlue, stdout);
+                        std::fputc(pending.front(), stdout);
+                        std::fflush(stdout);
+                        pending.erase(0, 1);
+                    }
+                }
+            };
             std::printf("\nassistant> ");
             std::fflush(stdout);
             GenerationResult<float> result;
             try {
                 result = session.generate(
                     decoder, max_new_tokens, [&](const DecodedToken<float>& t) {
-                        pending += t.text;
-                        const std::size_t n = complete_utf8_prefix(pending);
-                        std::fwrite(pending.data(), 1, n, stdout);
-                        std::fflush(stdout);
-                        pending.erase(0, n);
+                        stream_text(t.text);
                         return !g_interrupted;
                     });
             } catch (const std::exception& e) {
                 std::signal(SIGINT, SIG_DFL);
-                std::printf("\n[error: %s]\n", e.what());
+                std::printf("%s\n[error: %s]\n", kReset, e.what());
                 session.agent().pop_message();  // the unanswered user message
                 std::printf("[use /reset to start over]\n");
                 continue;
             }
             std::signal(SIGINT, SIG_DFL);
+            stream_text("");
             std::fwrite(pending.data(), 1, pending.size(), stdout);
+            std::printf("%s", kReset);
 
             switch (result.stop) {
                 case StopReason::EndOfTurn: break;

@@ -17,7 +17,7 @@ public:
         template_.set_system_prompt(std::move(system));
         return *this;
     }
-    SmollAgent& set_tools(std::vector<std::string> tools) {
+    SmollAgent& set_tools(std::vector<chat::Tool> tools) {
         template_.set_tools(std::move(tools));
         return *this;
     }
