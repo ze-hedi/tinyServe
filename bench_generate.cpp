@@ -1,6 +1,9 @@
 #include "decoder.h"
 #include "smoll_session.h"
 #include "smollm3.h"
+#ifdef TINYSERVE_CUDA
+#include "gpu_tail.h"
+#endif
 
 #include <chrono>
 #include <csignal>
@@ -182,6 +185,8 @@ int main(int argc, char* argv[]) {
         std::size_t threads = mat_detail::default_thread_count();
         std::size_t layers = 0;
         std::size_t context = 4096;
+        std::size_t gpu_layers = 0;  // last N layers (and the head) on the GPU; 0 = CPU only
+        bool gpu_head = true;
         std::size_t max_new_tokens = std::numeric_limits<std::size_t>::max();
 
         for (int i = 1; i < argc; ++i) {
@@ -200,6 +205,10 @@ int main(int argc, char* argv[]) {
                 context = std::stoull(argv[++i]);
             } else if (arg == "--threads" && i + 1 < argc) {
                 threads = std::stoull(argv[++i]);
+            } else if (arg == "--gpu-layers" && i + 1 < argc) {
+                gpu_layers = std::stoull(argv[++i]);
+            } else if (arg == "--no-gpu-head") {
+                gpu_head = false;
             } else if (arg == "--layers" && i + 1 < argc) {
                 layers = std::stoull(argv[++i]);
             } else if (!arg.starts_with("--")) {
@@ -218,6 +227,18 @@ int main(int argc, char* argv[]) {
         auto load_start = Clock::now();
         SmolLM3<float> model(model_root, config, {}, threads);
         std::printf("Model loaded in %.1f ms\n", ms_since(load_start));
+
+        if (gpu_layers > 0) {
+#ifdef TINYSERVE_CUDA
+            auto upload_start = Clock::now();
+            model.set_tail(gpu::make_gpu_tail(model, gpu_layers, gpu_head, context));
+            std::printf("%s (uploaded in %.0f ms)\n", model.tail()->description().c_str(),
+                        ms_since(upload_start));
+#else
+            std::fprintf(stderr, "--gpu-layers needs a build with -DTINYSERVE_CUDA=ON\n");
+            return 2;
+#endif
+        }
 
         SmollSession<float> session(model);
         session.set_context_tokens(context);

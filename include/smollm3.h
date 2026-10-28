@@ -5,14 +5,18 @@
 #include "llama_mmap_block.h"
 #include "mat.h"
 #include "mmap_block_loader.h"
+#include "tail_backend.h"
 #include "thread_pool.h"
 #include "tokenizer.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 // SmolLM3 model: embedding + transformer blocks + final norm + lm_head.
@@ -88,12 +92,44 @@ public:
     //   prefill: empty cache + whole prompt     decode: one token at a time
     // Returns last-position logits (1, vocab_size) and commits the tokens to the cache.
     Mat<T> next_token_logits(const std::vector<uint32_t>& ids32, KVCache<T>& cache) {
+        if (tail_) return next_token_logits_tail(ids32, cache);
         Mat<T> hidden = forward_hidden(to_positions(ids32), &cache);
         cache.advance(ids32.size());
         return last_row_logits(hidden);
     }
 
     const Tokenizer& tokenizer() const { return tokenizer_; }
+
+    // Weights, for building a TailBackend from the same mappings.
+    const MMapLlamaBlockWeights& block_weights(std::size_t layer) const {
+        return block_weights_.at(layer);
+    }
+    const MMapWeight& embed_weights() const { return embed_weights_; }
+    const MMapWeight& final_norm_weights() const { return final_norm_weights_; }
+
+    // Run the last layers (and maybe the head) on a TailBackend. Only the cached paths
+    // (next_token_logits with a KVCache) use it; the host keeps every weight, so forward() and
+    // the cache-less calls still run entirely on the CPU. Pass nullptr to detach. float only.
+    //
+    // Split of work: decode (one token) runs layers [0, first_layer) here and the rest on the
+    // tail. Prefill (several tokens) still runs every layer here, then copies the new K/V rows
+    // of the tail layers to the device. The tail layers' K/V rows produced on the device during
+    // decode are copied back lazily, only when a later prefill needs them on the host.
+    void set_tail(std::unique_ptr<TailBackend> tail) {
+        if (tail) {
+            if (!std::is_same_v<T, float>) {
+                throw std::logic_error("SmolLM3: a tail backend needs float32");
+            }
+            if (tail->first_layer() >= config_.n_layers) {
+                throw std::invalid_argument("SmolLM3: tail starts past the last layer");
+            }
+        }
+        tail_ = std::move(tail);
+        tail_device_rows_ = 0;
+        tail_host_rows_ = 0;
+    }
+    bool has_tail() const { return tail_ != nullptr; }
+    const TailBackend* tail() const { return tail_.get(); }
 
 private:
     static std::vector<std::size_t> to_positions(const std::vector<uint32_t>& ids32) {
@@ -106,12 +142,105 @@ private:
     // Embedding + transformer blocks (before the final norm). With a cache, the tokens sit at
     // positions cache->length() onwards; the caller advances the cache afterwards.
     Mat<T> forward_hidden(const std::vector<std::size_t>& token_ids,
-                          KVCache<T>* cache = nullptr) {
+                          KVCache<T>* cache = nullptr,
+                          std::size_t layer_end = std::numeric_limits<std::size_t>::max()) {
         Mat<T> hidden = embedding_.forward(token_ids);
-        for (std::size_t i = 0; i < blocks_.size(); ++i) {
+        const std::size_t end = std::min(blocks_.size(), layer_end);
+        for (std::size_t i = 0; i < end; ++i) {
             hidden = blocks_[i]->forward(hidden, cache, i);
         }
         return hidden;
+    }
+
+    // Cached next-token logits with the last layers on tail_.
+    //
+    // Row bookkeeping (K/V rows of the tail layers; "device" = the tail's copy):
+    //   tail_device_rows_: rows [0, n) are valid on the device
+    //   tail_host_rows_:   rows [0, n) are valid in the host KVCache
+    // The host cache length (cache.length()) is the truth for the position; truncating it just
+    // shortens both counters. Decode writes one device row, prefill writes the same rows on
+    // both sides.
+    Mat<T> next_token_logits_tail(const std::vector<uint32_t>& ids32, KVCache<T>& cache) {
+        if constexpr (std::is_same_v<T, float>) {
+            const std::vector<std::size_t> positions = to_positions(ids32);
+            const std::size_t first = tail_->first_layer();
+            const std::size_t pos0 = cache.length();
+            const std::size_t kv_dim = cache.kv_dim();
+            const std::size_t d = config_.d_model;
+
+            tail_device_rows_ = std::min(tail_device_rows_, pos0);
+            tail_host_rows_ = std::min(tail_host_rows_, pos0);
+            if (tail_device_rows_ < pos0) {
+                throw std::logic_error(
+                    "SmolLM3: the tail's KV cache is behind the host cache (tail attached "
+                    "after tokens were cached?)");
+            }
+            if (cache.capacity() > tail_->kv_capacity()) {
+                throw std::length_error("SmolLM3: the tail's KV cache holds " +
+                                        std::to_string(tail_->kv_capacity()) +
+                                        " tokens, fewer than the context of " +
+                                        std::to_string(cache.capacity()));
+            }
+
+            if (positions.size() == 1) {
+                // Decode: layers [0, first) here, the rest on the tail.
+                Mat<T> hidden = forward_hidden(positions, &cache, first);
+                std::vector<float> in = row_of(hidden, 0);
+                Mat<T> logits(1, 1);
+                if (tail_->has_head()) {
+                    const std::size_t vocab = embed_weights_.out_features();
+                    std::vector<float> out(vocab);
+                    tail_->decode_logits(in.data(), pos0, out.data());
+                    logits = Mat<T>(1, vocab, std::move(out));
+                } else {
+                    std::vector<float> out(d);
+                    tail_->decode(in.data(), out.data(), pos0);
+                    logits = last_row_logits(Mat<T>(1, d, std::move(out)));
+                }
+                tail_device_rows_ = pos0 + 1;  // the tail wrote row pos0 of every tail layer
+                cache.advance(1);
+                return logits;
+            }
+
+            // Prefill: every layer here. The tail layers attend over [0, pos0) on the host, so
+            // first fetch any of those rows that only exist on the device.
+            if (tail_host_rows_ < pos0) {
+                const std::size_t rows = pos0 - tail_host_rows_;
+                for (std::size_t layer = first; layer < config_.n_layers; ++layer) {
+                    tail_->download_kv(layer, tail_host_rows_, rows,
+                                       cache.k(layer) + tail_host_rows_ * kv_dim,
+                                       cache.v(layer) + tail_host_rows_ * kv_dim);
+                }
+            }
+            Mat<T> hidden = forward_hidden(positions, &cache);
+            for (std::size_t layer = first; layer < config_.n_layers; ++layer) {
+                tail_->upload_kv(layer, pos0, positions.size(), cache.k(layer) + pos0 * kv_dim,
+                                 cache.v(layer) + pos0 * kv_dim);
+            }
+            tail_device_rows_ = tail_host_rows_ = pos0 + positions.size();
+
+            Mat<T> logits(1, 1);
+            if (tail_->has_head()) {
+                const std::size_t vocab = embed_weights_.out_features();
+                std::vector<float> out(vocab);
+                tail_->head_logits(row_of(hidden, hidden.rows() - 1).data(), out.data());
+                logits = Mat<T>(1, vocab, std::move(out));
+            } else {
+                logits = last_row_logits(hidden);
+            }
+            cache.advance(positions.size());
+            return logits;
+        } else {
+            (void)ids32;
+            (void)cache;
+            throw std::logic_error("SmolLM3: a tail backend needs float32");
+        }
+    }
+
+    static std::vector<T> row_of(const Mat<T>& m, std::size_t r) {
+        std::vector<T> row(m.cols());
+        for (std::size_t c = 0; c < m.cols(); ++c) row[c] = m(r, c);
+        return row;
     }
 
     // (rows, d_model) normalized -> (rows, vocab_size)
@@ -144,4 +273,9 @@ private:
 
     // Tokenizer
     Tokenizer tokenizer_;
+
+    // Optional GPU tail (see set_tail) and the validity of its K/V rows.
+    std::unique_ptr<TailBackend> tail_;
+    std::size_t tail_device_rows_ = 0;
+    std::size_t tail_host_rows_ = 0;
 };

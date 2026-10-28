@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(TINYSERVE_NATIVE "Optimize the mmap benchmark for the build host CPU" OFF)
+option(TINYSERVE_CUDA "Build the GPU decode path (cuda/); needs the CUDA toolkit" OFF)
 
 include(FetchContent)
 
@@ -64,6 +65,13 @@ if(TINYSERVE_NATIVE)
 endif()
 
 add_subdirectory(tui)
+
+if(TINYSERVE_CUDA)
+    enable_language(CUDA)
+    add_subdirectory(cuda)
+    target_link_libraries(bench_generate PRIVATE gpu_tail)
+    target_compile_definitions(bench_generate PRIVATE TINYSERVE_CUDA)
+endif()
 
 add_executable(example_chat_context example_chat_context.cpp)
 target_include_directories(example_chat_context PRIVATE ${CMAKE_SOURCE_DIR}/include)
