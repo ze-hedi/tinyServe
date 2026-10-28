@@ -82,7 +82,7 @@ The converter copies tokenizer files if they are present in the snapshot. `token
 Simple line-oriented chat:
 
 ```bash
-./build/bench_generate smollm3 --no-think --max-new 128
+./build/chat smollm3 --no-think --max-new 128
 ```
 
 Terminal UI with a dedicated input box:
@@ -91,11 +91,11 @@ Terminal UI with a dedicated input box:
 ./build/tui/tui_chat smollm3 --no_think
 ```
 
-The flag spelling differs: **`--no-think`** for `bench_generate`, **`--no_think`** for `tui_chat`. Both enable thinking mode by default.
+The flag spelling differs: **`--no-think`** for `chat`, **`--no_think`** for `tui_chat`. Both enable thinking mode by default.
 
 ## Chat options and controls
 
-| Option | `bench_generate` | `tui_chat` | Meaning |
+| Option | `chat` | `tui_chat` | Meaning |
 |---|---|---|---|
 | Positional model directory | Yes | Yes | Defaults to `smollm3` |
 | `--system TEXT` | Yes | Yes | Defaults to `You are a helpful assistant.` |
@@ -117,7 +117,7 @@ In either chat interface:
 
 The line-oriented interface also supports `/system TEXT` (replace the system prompt and clear history), `/show` (print tagged context), `/help`, and `/quit`.
 
-In `bench_generate`, Ctrl-C stops generation and exits when pressed at the prompt. In the TUI, Ctrl-C or Esc stops an answer. Cancellation is checked between generated tokens, so it does not interrupt an in-progress forward pass.
+In `chat`, Ctrl-C stops generation and exits when pressed at the prompt. In the TUI, Ctrl-C or Esc stops an answer. Cancellation is checked between generated tokens, so it does not interrupt an in-progress forward pass.
 
 Generation uses greedy argmax and stops at `<|im_end|>`, the token limit, or cancellation. Context does not automatically slide or evict old messages: use `/reset` when it fills. The line-oriented program currently labels every token-limit stop `[context full]`, including stops caused by `--max-new`.
 
@@ -225,7 +225,7 @@ TINY_SERVE_TOKENIZER_JSON=smollm3/tokenizer/tokenizer.json ./build/tokenizer_tes
 | `bench_smollm3_mmap` | Full-model forward on synthetic token IDs; optional partial layers and reference check |
 | `bench_generate_next` | One next-token prediction from raw text, without chat formatting |
 | `bench_chat_prefill` | Rendered chat prompt → first token; inspect prompt, IDs, top logits, and repeated prefill timings |
-| `bench_generate` | Interactive multi-turn generation with cache-reuse and decode timing statistics |
+| `chat` | Interactive multi-turn generation with cache-reuse and decode timing statistics |
 | `example_chat_context` | Render and tokenize message history without loading model weights |
 | `tokenizer_test` | Standalone tokenizer throughput benchmark |
 | `tui/tui_chat` | Terminal chat interface |
@@ -252,7 +252,7 @@ Examples:
   --seq 4 --layers 1 --threads 6 --warmup 1 --iters 3 --check
 
 # Bound generation length and compare cached vs. uncached final-token predictions.
-./build/bench_generate smollm3 --no-think --max-new 16 --verify
+./build/chat smollm3 --no-think --max-new 16 --verify
 ```
 
 Both mmap benchmarks accept `--prefault` (`MAP_POPULATE`) and `--hugepages` (`MADV_HUGEPAGE` advice), as well as `--seq`, `--threads`, `--warmup`, `--iters`, and `--check`. Their `--help` prints usage. Passing `smollm3/bloc_0` explicitly avoids the single-block benchmark's legacy default of `bloc_0`.

@@ -235,6 +235,7 @@ int main(int argc, char* argv[]) {
             std::printf("%s (uploaded in %.0f ms)\n", model.tail()->description().c_str(),
                         ms_since(upload_start));
 #else
+            (void)gpu_head;
             std::fprintf(stderr, "--gpu-layers needs a build with -DTINYSERVE_CUDA=ON\n");
             return 2;
 #endif
@@ -395,7 +396,7 @@ int main(int argc, char* argv[]) {
         }
         return 0;
     } catch (const std::exception& e) {
-        std::fprintf(stderr, "bench_generate: %s\n", e.what());
+        std::fprintf(stderr, "chat: %s\n", e.what());
         return 1;
     }
 }

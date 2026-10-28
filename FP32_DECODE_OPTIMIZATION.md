@@ -56,7 +56,7 @@ This showed that using every logical CPU was not the best choice on this hybrid 
 
 The interactive benchmark originally generated until the model ended its answer. That made different runs difficult to compare.
 
-I added two options to `bench_generate.cpp`:
+I added two options to `chat.cpp`:
 
 ```text
 --no-think
@@ -68,7 +68,7 @@ I added two options to `bench_generate.cpp`:
 The main comparison used the same prompt and 16 generated tokens for every run:
 
 ```bash
-./build/bench_generate --no-think --max-new 16
+./build/chat --no-think --max-new 16
 ```
 
 ---
@@ -227,14 +227,14 @@ This exceeds the original 2 tokens/second target.
   - Uses the new default thread-count helper.
 - `tui/main.cpp`
   - Uses the new default thread-count helper.
-- `bench_generate.cpp`
+- `chat.cpp`
   - Adds repeatable benchmark options and uses the new default.
 
 ## Reproduce the result
 
 ```bash
-cmake --build build --target bench_generate -j2
-./build/bench_generate --no-think --max-new 16
+cmake --build build --target chat -j2
+./build/chat --no-think --max-new 16
 ```
 
 All accepted optimizations remain strictly **FP32-only**.

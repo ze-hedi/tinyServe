@@ -10,7 +10,7 @@
 #include <string>
 
 // Chat on the terminal with the input box fixed at the bottom. Same conversation logic as
-// bench_generate: every turn joins the session history and the KV cache is kept.
+// chat: every turn joins the session history and the KV cache is kept.
 // The model runs on the main thread; the token callback polls the keyboard to stop the answer.
 
 static const std::string kDim = "\x1b[2m";
@@ -18,7 +18,7 @@ static const std::string kBold = "\x1b[1m";
 static const std::string kReset = "\x1b[0m";
 
 // Length of the longest prefix of s that does not end in the middle of a UTF-8 character
-// (same helper as bench_generate: tokens can split a character).
+// (same helper as chat: tokens can split a character).
 static std::size_t complete_utf8_prefix(const std::string& s) {
     std::size_t i = s.size();
     std::size_t back = 0;
