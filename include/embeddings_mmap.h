@@ -8,15 +8,16 @@
 #include <vector>
 
 // Embedding layer backed by mmap weights (zero-copy storage).
-// Borrows a MMapWeight of shape (vocab_size, embed_dim).
+// Borrows a column-major MMapWeight of logical shape (embed_dim, vocab_size): token id t
+// is the contiguous column t. The same mapping serves as the tied lm_head.
 template <typename T>
 class Embedding_MMap {
 public:
     explicit Embedding_MMap(const MMapWeight* weight)
         : weight_{weight} {}
 
-    std::size_t vocab_size() const { return weight_->rows(); }
-    std::size_t embed_dim() const { return weight_->cols(); }
+    std::size_t vocab_size() const { return weight_->out_features(); }
+    std::size_t embed_dim() const { return weight_->in_features(); }
 
     // Look up embeddings for a sequence of token IDs.
     // Returns a (seq_len, embed_dim) matrix.
@@ -28,14 +29,13 @@ public:
         const std::size_t seq_len = token_ids.size();
         const std::size_t d = embed_dim();
         const std::size_t v = vocab_size();
-        const float* base = weight_->data();
 
         std::vector<T> data(seq_len * d);
         for (std::size_t i = 0; i < seq_len; ++i) {
             if (token_ids[i] >= v) {
                 throw std::out_of_range("token_id out of vocabulary range");
             }
-            const float* row = base + token_ids[i] * d;
+            const float* row = weight_->col(token_ids[i]);
             for (std::size_t j = 0; j < d; ++j) {
                 data[i * d + j] = static_cast<T>(row[j]);
             }

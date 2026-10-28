@@ -58,9 +58,10 @@ int main(int argc, char* argv[]) {
         std::string system_prompt = "You are a helpful assistant.";
         bool thinking = true;
         bool verify = false;
-        std::size_t threads = mat_detail::hardware_thread_count();
+        std::size_t threads = mat_detail::default_thread_count();
         std::size_t layers = 0;
         std::size_t context = 4096;
+        std::size_t max_new_tokens = std::numeric_limits<std::size_t>::max();
 
         for (int i = 1; i < argc; ++i) {
             std::string arg(argv[i]);
@@ -68,6 +69,10 @@ int main(int argc, char* argv[]) {
                 system_prompt = argv[++i];
             } else if (arg == "--think") {
                 thinking = true;
+            } else if (arg == "--no-think") {
+                thinking = false;
+            } else if (arg == "--max-new" && i + 1 < argc) {
+                max_new_tokens = std::stoull(argv[++i]);
             } else if (arg == "--verify") {
                 verify = true;
             } else if (arg == "--ctx" && i + 1 < argc) {
@@ -141,7 +146,7 @@ int main(int argc, char* argv[]) {
             GenerationResult<float> result;
             try {
                 result = session.generate(
-                    decoder, std::numeric_limits<std::size_t>::max(), [&](const DecodedToken<float>& t) {
+                    decoder, max_new_tokens, [&](const DecodedToken<float>& t) {
                         pending += t.text;
                         const std::size_t n = complete_utf8_prefix(pending);
                         std::fwrite(pending.data(), 1, n, stdout);

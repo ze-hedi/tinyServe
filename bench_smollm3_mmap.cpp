@@ -115,10 +115,20 @@ Mat<float> random_mat(std::size_t rows, std::size_t cols, std::mt19937& rng) {
     return Mat<float>(rows, cols, std::move(data));
 }
 
+// Owned row-major copy of a column-major MMapWeight: (K, N) for a linear weight, and the
+// (1, d) row vector the owned RMSNorm expects for a (d, 1) gamma.
 Mat<float> copy_weight(const MMapWeight& weight) {
-    const float* source = weight.data();
-    return Mat<float>(weight.rows(), weight.cols(),
-                      std::vector<float>(source, source + weight.rows() * weight.cols()));
+    const std::size_t K = weight.in_features();
+    const std::size_t N = weight.out_features();
+    if (N == 1) {
+        return Mat<float>(1, K, std::vector<float>(weight.data(), weight.data() + K));
+    }
+    std::vector<float> data(K * N);
+    for (std::size_t j = 0; j < N; ++j) {
+        const float* column = weight.col(j);
+        for (std::size_t k = 0; k < K; ++k) data[k * N + j] = column[k];
+    }
+    return Mat<float>(K, N, std::move(data));
 }
 
 Faults faults() {
@@ -241,9 +251,7 @@ int main(int argc, char* argv[]) {
                                                      "final_norm", options.mmap_options);
             RMSNorm_MMap<float> ref_norm(&fnorm_w);
             expected = ref_norm.forward(expected, pool);
-            auto lmhead_w = load_mapped_single_tensor(root_path, "lm_head.json",
-                                                      "lm_head", options.mmap_options);
-            expected = expected.matmul(lmhead_w, pool);
+            expected = expected.matmul(embed_w, pool);  // tied lm_head
             double max_abs_error = 0.0;
             double max_relative_error = 0.0;
             for (std::size_t r = 0; r < out.rows(); ++r) {

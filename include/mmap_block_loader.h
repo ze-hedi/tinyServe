@@ -123,13 +123,20 @@ private:
 
 // Read-only weight matrix backed by mmap. The mapping must stay alive for
 // the lifetime of this object — data is never copied.
+//
+// Column-major only: the logical matrix is W[K, N] (in_features x out_features, so that
+// y = x @ W) and element (k, n) lives at data()[n * K + k]. Each output column is a
+// contiguous run of K floats, which is exactly the HF [out, in] row-major byte layout.
+// Vectors (norm gammas) are stored as [d, 1].
 class MMapWeight {
 public:
     MMapWeight() = default;
 
-    std::size_t rows() const { return rows_; }
-    std::size_t cols() const { return cols_; }
+    std::size_t in_features() const { return k_; }
+    std::size_t out_features() const { return n_; }
     const float* data() const { return data_; }
+    // Contiguous column j: K floats.
+    const float* col(std::size_t j) const { return data_ + j * k_; }
 
     // Parse manifest entry, mmap the .bin file, and reinterpret as float*.
     void load(const std::filesystem::path& directory,
@@ -146,7 +153,7 @@ public:
         if (!entry) {
             throw std::runtime_error("mmap loader: manifest is missing tensor '" + name + "'");
         }
-        if (entry->at("dtype") != "float32" || entry->at("layout") != "row-major" ||
+        if (entry->at("dtype") != "float32" || entry->at("layout") != "column-major" ||
             entry->at("byte_order") != "little-endian") {
             throw std::runtime_error("mmap loader: unsupported format for tensor '" + name + "'");
         }
@@ -159,12 +166,12 @@ public:
         if (!shape.is_array() || shape.size() != 2) {
             throw std::runtime_error("mmap loader: expected a 2D tensor for '" + name + "'");
         }
-        rows_ = shape[0].get<std::size_t>();
-        cols_ = shape[1].get<std::size_t>();
-        if (cols_ != 0 && rows_ > std::numeric_limits<std::size_t>::max() / cols_) {
+        k_ = shape[0].get<std::size_t>();
+        n_ = shape[1].get<std::size_t>();
+        if (n_ != 0 && k_ > std::numeric_limits<std::size_t>::max() / n_) {
             throw std::runtime_error("mmap loader: shape overflows for tensor '" + name + "'");
         }
-        const std::size_t elements = rows_ * cols_;
+        const std::size_t elements = k_ * n_;
         if (elements > std::numeric_limits<std::size_t>::max() / sizeof(float)) {
             throw std::runtime_error("mmap loader: tensor is too large: '" + name + "'");
         }
@@ -190,9 +197,12 @@ public:
 private:
     ReadOnlyMapping mapping_{};
     const float* data_{nullptr};
-    std::size_t rows_{0};
-    std::size_t cols_{0};
+    std::size_t k_{0};
+    std::size_t n_{0};
 };
+
+// Version 2: every tensor is column-major (see MMapWeight). Version 1 was row-major.
+inline constexpr int kMMapFormatVersion = 2;
 
 struct MMapLlamaBlockWeights {
     MMapWeight input_layernorm;
@@ -227,7 +237,7 @@ inline MMapWeight load_mapped_single_tensor(
             std::string("mmap loader: invalid JSON in ") + json_filename + ": " + error.what());
     }
     if (manifest.at("format") != "tinyserve-float32-matrices" ||
-        manifest.at("format_version") != 1) {
+        manifest.at("format_version") != kMMapFormatVersion) {
         throw std::runtime_error("mmap loader: unsupported manifest format in " + json_filename);
     }
 
@@ -256,7 +266,7 @@ inline MMapLlamaBlockWeights load_mapped_llama_block(
         throw std::runtime_error(std::string("mmap loader: invalid shapes.json: ") + error.what());
     }
     if (manifest.at("format") != "tinyserve-float32-matrices" ||
-        manifest.at("format_version") != 1) {
+        manifest.at("format_version") != kMMapFormatVersion) {
         throw std::runtime_error("mmap loader: unsupported block manifest format");
     }
 

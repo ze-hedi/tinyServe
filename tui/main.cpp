@@ -136,7 +136,7 @@ int main(int argc, char* argv[]) {
         std::string model_root = "smollm3";
         std::string system_prompt = "You are a helpful assistant.";
         bool thinking = true;
-        std::size_t threads = mat_detail::hardware_thread_count();
+        std::size_t threads = mat_detail::default_thread_count();
         std::size_t layers = 0;
         std::size_t context = 4096;
 

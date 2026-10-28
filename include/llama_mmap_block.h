@@ -96,17 +96,17 @@ public:
         if (n_heads_ % n_kv_heads_ != 0) {
             throw std::invalid_argument("n_heads must be divisible by n_kv_heads");
         }
-        std::size_t d = W_q_->rows();
-        if (W_q_->cols() != n_heads_ * head_dim_) {
-            throw std::invalid_argument("W_q cols must equal n_heads * head_dim");
+        std::size_t d = W_q_->in_features();
+        if (W_q_->out_features() != n_heads_ * head_dim_) {
+            throw std::invalid_argument("W_q out_features must equal n_heads * head_dim");
         }
-        if (W_k_->rows() != d || W_k_->cols() != n_kv_heads_ * head_dim_) {
+        if (W_k_->in_features() != d || W_k_->out_features() != n_kv_heads_ * head_dim_) {
             throw std::invalid_argument("W_k dimensions mismatch");
         }
-        if (W_v_->rows() != d || W_v_->cols() != n_kv_heads_ * head_dim_) {
+        if (W_v_->in_features() != d || W_v_->out_features() != n_kv_heads_ * head_dim_) {
             throw std::invalid_argument("W_v dimensions mismatch");
         }
-        if (W_o_->rows() != n_heads_ * head_dim_ || W_o_->cols() != d) {
+        if (W_o_->in_features() != n_heads_ * head_dim_ || W_o_->out_features() != d) {
             throw std::invalid_argument("W_o dimensions mismatch");
         }
     }
@@ -114,7 +114,7 @@ public:
     std::size_t n_heads() const { return n_heads_; }
     std::size_t n_kv_heads() const { return n_kv_heads_; }
     std::size_t head_dim() const { return head_dim_; }
-    std::size_t d_model() const { return W_q_->rows(); }
+    std::size_t d_model() const { return W_q_->in_features(); }
 
     // x: (seq_len, d_model) -> output: (seq_len, d_model)
     //
@@ -279,18 +279,18 @@ public:
     // W_down: (d_ff, d_model)
     SwiGLU_MMap(const MMapWeight* W_gate, const MMapWeight* W_up, const MMapWeight* W_down)
         : W_gate_{W_gate}, W_up_{W_up}, W_down_{W_down} {
-        std::size_t d = W_gate_->rows();
-        std::size_t ff = W_gate_->cols();
-        if (W_up_->rows() != d || W_up_->cols() != ff) {
+        std::size_t d = W_gate_->in_features();
+        std::size_t ff = W_gate_->out_features();
+        if (W_up_->in_features() != d || W_up_->out_features() != ff) {
             throw std::invalid_argument("SwiGLU_MMap: W_up dimensions must match W_gate");
         }
-        if (W_down_->rows() != ff || W_down_->cols() != d) {
+        if (W_down_->in_features() != ff || W_down_->out_features() != d) {
             throw std::invalid_argument("SwiGLU_MMap: W_down must be (d_ff, d_model)");
         }
     }
 
-    std::size_t d_model() const { return W_gate_->rows(); }
-    std::size_t d_ff() const { return W_gate_->cols(); }
+    std::size_t d_model() const { return W_gate_->in_features(); }
+    std::size_t d_ff() const { return W_gate_->out_features(); }
 
     // x: (seq_len, d_model) -> (seq_len, d_model)
     Mat<T> forward(const Mat<T>& x, ThreadPool& pool) const {
@@ -311,18 +311,18 @@ private:
 };
 
 // RMSNorm backed by mmap gamma weights (zero-copy).
-// gamma is a (1, d_model) row vector stored as an MMapWeight.
+// gamma is a (d_model, 1) column vector stored as an MMapWeight.
 template <typename T>
 class RMSNorm_MMap {
 public:
     RMSNorm_MMap(const MMapWeight* gamma, T eps = static_cast<T>(1e-6f))
         : gamma_{gamma}, eps_{eps} {
-        if (gamma_->rows() != 1) {
-            throw std::invalid_argument("RMSNorm_MMap: gamma must be a (1, d_model) row vector");
+        if (gamma_->out_features() != 1) {
+            throw std::invalid_argument("RMSNorm_MMap: gamma must be a (d_model, 1) column vector");
         }
     }
 
-    std::size_t d_model() const { return gamma_->cols(); }
+    std::size_t d_model() const { return gamma_->in_features(); }
 
     // x: (seq_len, d_model) -> (seq_len, d_model)
     Mat<T> forward(const Mat<T>& x, ThreadPool& pool) const {

@@ -24,10 +24,8 @@
 // thread waits (it does not execute tasks itself), matching the previous
 // spawn-num_threads-and-join semantics.
 //
-// Each worker is pinned to one logical CPU (worker i -> i-th CPU of the
-// process's allowed affinity mask, wrapping around if there are more workers
-// than CPUs). Pinning is best-effort: it is Linux-only and silently skipped if
-// the affinity calls fail.
+// Each worker is pinned to one logical CPU. The allowed CPUs are ordered to use one SMT sibling
+// per physical core before the second siblings; pinning is best-effort and Linux-only.
 //
 // Contract: run() must be called from a single thread at a time (fork/join,
 // not nested). All state below is guarded by mutex_.
@@ -36,6 +34,7 @@ public:
     explicit ThreadPool(std::size_t workers)
         : workers_{std::max<std::size_t>(1, workers)} {
         const std::vector<int> cpus = allowed_cpus();
+        if (!cpus.empty()) pin_current_thread(cpus.front());
         threads_.reserve(workers_);
         for (std::size_t i = 0; i < workers_; ++i) {
             const int cpu = cpus.empty() ? -1 : cpus[i % cpus.size()];
@@ -85,7 +84,7 @@ public:
     }
 
 private:
-    // Logical CPUs this process may run on, in increasing order.
+    // Logical CPUs this process may run on, with one SMT sibling per core first.
     static std::vector<int> allowed_cpus() {
         std::vector<int> cpus;
 #if defined(__linux__)
@@ -97,6 +96,15 @@ private:
                     cpus.push_back(c);
                 }
             }
+        }
+        if (!cpus.empty()) {
+            // On typical x86 topology, adjacent logical IDs are SMT siblings. Taking even positions
+            // first selects one sibling per core (P-cores first on the target hybrid machine).
+            std::vector<int> ordered;
+            ordered.reserve(cpus.size());
+            for (std::size_t i = 0; i < cpus.size(); i += 2) ordered.push_back(cpus[i]);
+            for (std::size_t i = 1; i < cpus.size(); i += 2) ordered.push_back(cpus[i]);
+            cpus = std::move(ordered);
         }
 #endif
         return cpus;

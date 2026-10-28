@@ -124,6 +124,93 @@ inline void mmap_micro_kernel_6x16_avx2(
     _mm256_storeu_ps(C + 5 * ldc + 8, c51);
 }
 
+// ---- Column-major weight kernels: C(i, j) += dot(A row i, W column j) ----
+//
+// A rows and W columns are both contiguous over k, so every operand is a plain 8-float load:
+// acc(r, c) holds 8 partial sums of the same C(r, c), one per k lane, reduced by a single
+// horizontal sum after the kc loop. Per k-step: MR A loads kept in registers, then each W
+// column is loaded once and reused for all MR rows. Registers: MR*NR acc + MR A + 1 W
+// (2x4 -> 11, 1x8 -> 10 of 16 ymm).
+
+__attribute__((target("avx2,fma")))
+inline float hsum256(__m256 v) {
+    const __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    const __m128 hi = _mm_movehl_ps(lo, lo);
+    const __m128 sum2 = _mm_add_ps(lo, hi);
+    return _mm_cvtss_f32(_mm_add_ss(sum2, _mm_shuffle_ps(sum2, sum2, 0x1)));
+}
+
+// C[r * ldc + c] += sum_{k < kc} A[r * lda + k] * W[c * ldw + k]  for r < MR, c < NR.
+template <std::size_t MR, std::size_t NR>
+__attribute__((target("avx2,fma")))
+inline void colmajor_dot_kernel_avx2(const float* A, std::size_t lda,
+                                     const float* W, std::size_t ldw,
+                                     float* C, std::size_t ldc, std::size_t kc) {
+    __m256 acc[MR][NR];
+#pragma GCC unroll 16
+    for (std::size_t r = 0; r < MR; ++r) {
+#pragma GCC unroll 16
+        for (std::size_t c = 0; c < NR; ++c) acc[r][c] = _mm256_setzero_ps();
+    }
+
+    std::size_t k = 0;
+    for (; k + 8 <= kc; k += 8) {
+        __m256 a[MR];
+#pragma GCC unroll 16
+        for (std::size_t r = 0; r < MR; ++r) a[r] = _mm256_loadu_ps(A + r * lda + k);
+#pragma GCC unroll 16
+        for (std::size_t c = 0; c < NR; ++c) {
+            const __m256 w = _mm256_loadu_ps(W + c * ldw + k);
+#pragma GCC unroll 16
+            for (std::size_t r = 0; r < MR; ++r) acc[r][c] = _mm256_fmadd_ps(a[r], w, acc[r][c]);
+        }
+    }
+
+#pragma GCC unroll 16
+    for (std::size_t r = 0; r < MR; ++r) {
+#pragma GCC unroll 16
+        for (std::size_t c = 0; c < NR; ++c) {
+            float sum = hsum256(acc[r][c]);
+            for (std::size_t kk = k; kk < kc; ++kk) sum += A[r * lda + kk] * W[c * ldw + kk];
+            C[r * ldc + c] += sum;
+        }
+    }
+}
+
+// Decode-only 1x4 kernel: two K blocks per iteration and two independent
+// accumulator chains per output. Real model K dimensions are multiples of 16;
+// the scalar epilogue keeps arbitrary shapes correct.
+__attribute__((target("avx2,fma")))
+inline void colmajor_decode4_avx2(const float* A, const float* W, std::size_t ldw,
+                                  float* C, std::size_t K) {
+    __m256 acc0[4];
+    __m256 acc1[4];
+#pragma GCC unroll 4
+    for (std::size_t c = 0; c < 4; ++c) {
+        acc0[c] = _mm256_setzero_ps();
+        acc1[c] = _mm256_setzero_ps();
+    }
+
+    std::size_t k = 0;
+    for (; k + 16 <= K; k += 16) {
+        const __m256 a0 = _mm256_loadu_ps(A + k);
+        const __m256 a1 = _mm256_loadu_ps(A + k + 8);
+#pragma GCC unroll 4
+        for (std::size_t c = 0; c < 4; ++c) {
+            const float* w = W + c * ldw + k;
+            acc0[c] = _mm256_fmadd_ps(a0, _mm256_loadu_ps(w), acc0[c]);
+            acc1[c] = _mm256_fmadd_ps(a1, _mm256_loadu_ps(w + 8), acc1[c]);
+        }
+    }
+
+#pragma GCC unroll 4
+    for (std::size_t c = 0; c < 4; ++c) {
+        float sum = hsum256(_mm256_add_ps(acc0[c], acc1[c]));
+        for (std::size_t kk = k; kk < K; ++kk) sum += A[kk] * W[c * ldw + kk];
+        C[c] += sum;
+    }
+}
+
 inline bool has_avx2_fma() {
     static const bool supported =
         __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");

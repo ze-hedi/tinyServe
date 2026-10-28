@@ -33,7 +33,7 @@ public:
     SmolLM3(const std::filesystem::path& root_dir,
             const Config& config = {},
             const MMapLoadOptions& mmap_options = {},
-            std::size_t num_threads = mat_detail::hardware_thread_count())
+            std::size_t num_threads = mat_detail::default_thread_count())
         : config_{config},
           pool_{std::max<std::size_t>(1, num_threads)},
           embed_weights_{load_mapped_single_tensor(root_dir, "embed_tokens.json",
@@ -42,8 +42,6 @@ public:
           final_norm_weights_{load_mapped_single_tensor(root_dir, "final_norm.json",
                                                         "final_norm", mmap_options)},
           final_norm_{&final_norm_weights_},
-          lm_head_weights_{load_mapped_single_tensor(root_dir, "lm_head.json",
-                                                      "lm_head", mmap_options)},
           tokenizer_{(root_dir / "tokenizer" / "tokenizer.json").string()} {
 
         block_weights_.resize(config_.n_layers);
@@ -117,7 +115,7 @@ private:
     }
 
     // (rows, d_model) normalized -> (rows, vocab_size)
-    Mat<T> lm_head(const Mat<T>& normed) { return normed.matmul(lm_head_weights_, pool_); }
+    Mat<T> lm_head(const Mat<T>& normed) { return normed.matmul(embed_weights_, pool_); }
 
     // Only the last position is needed to pick the next token: norm and project that row alone.
     Mat<T> last_row_logits(const Mat<T>& hidden) {
@@ -132,7 +130,7 @@ private:
     Config config_;
     ThreadPool pool_;
 
-    // Embedding
+    // Embedding, column-major (d_model, vocab). Tied: also the lm_head weight.
     MMapWeight embed_weights_;
     Embedding_MMap<T> embedding_;
 
@@ -140,10 +138,9 @@ private:
     std::vector<MMapLlamaBlockWeights> block_weights_;
     std::vector<std::unique_ptr<LlamaBlock_MMap<T>>> blocks_;
 
-    // Final norm + lm_head
+    // Final norm
     MMapWeight final_norm_weights_;
     RMSNorm_MMap<T> final_norm_;
-    MMapWeight lm_head_weights_;
 
     // Tokenizer
     Tokenizer tokenizer_;

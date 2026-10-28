@@ -23,6 +23,10 @@ inline std::size_t hardware_thread_count() {
     const unsigned int count = std::thread::hardware_concurrency();
     return count == 0 ? 1 : static_cast<std::size_t>(count);
 }
+// Decode is weight-bandwidth-bound; a small physical-core team outperforms using every SMT/E-core.
+inline std::size_t default_thread_count() {
+    return std::min<std::size_t>(6, hardware_thread_count());
+}
 } // namespace mat_detail
 
 template <typename T>
@@ -139,6 +143,9 @@ public:
         if (cols_ != B.rows_) {
             throw std::invalid_argument("matmul: dimension mismatch");
         }
+        if constexpr (std::is_same_v<T, float>) {
+            return matmul_avx_tiled(B.data_.data(), B.cols_, pool);
+        }
 
         const std::size_t M = rows_;
         const std::size_t K = cols_;
@@ -178,79 +185,164 @@ public:
         return result;
     }
 
-    // v(1, k) * B_mmap(k, n) -> C(1, n), parallelized over K.
-    // Each worker owns a private partial output; no atomics or shared writes.
-    Mat vectmat(const MMapWeight& B, ThreadPool& pool) const {
-        if (rows_ != 1) {
-            throw std::invalid_argument("vectmat: left operand must have exactly 1 row");
+    // A(m, k) * W(k, n) -> C(m, n), W a column-major MMapWeight: c(i, j) = dot(A row i, W col j),
+    // both contiguous over k. M == 1 takes the decode path, M > 1 the tiled prefill path;
+    // the scalar path covers non-float T and CPUs without AVX2/FMA.
+    Mat matmul(const MMapWeight& W, ThreadPool& pool) const {
+        if (cols_ != W.in_features()) {
+            throw std::invalid_argument("matmul(MMapWeight): dimension mismatch");
         }
-        if (cols_ != B.rows()) {
-            throw std::invalid_argument("vectmat: dimension mismatch");
+        if (rows_ == 0 || W.out_features() == 0) {
+            return Mat(rows_, W.out_features());
         }
-
-        const std::size_t K = cols_;
-        const std::size_t N = B.cols();
-        constexpr std::size_t TJ = 64;
-        constexpr std::size_t TK = 64;
-
-        Mat result(1, N);
-        if (K == 0 || N == 0) {
-            return result;
-        }
-
-        const T* A_ptr = data_.data();
-        const float* B_ptr = B.data();
-        T* C_ptr = result.data_.data();
-        bool use_avx2 = false;
 #if defined(__x86_64__) || defined(__i386__)
         if constexpr (std::is_same_v<T, float>) {
-            use_avx2 = micro_kernels::has_avx2_fma();
+            if (micro_kernels::has_avx2_fma()) {
+                return rows_ == 1 ? matmul_colmajor_decode(W, pool)
+                                  : matmul_colmajor_prefill(W, pool);
+            }
         }
 #endif
-        const bool aligned_b = reinterpret_cast<std::uintptr_t>(B_ptr) % 32 == 0 && N % 8 == 0;
-        const std::size_t k_tiles = (K + TK - 1) / TK;
-        const std::size_t worker_count = std::min(pool.size(), k_tiles);
-        std::vector<T> partials((worker_count - 1) * N, T{0});
+        return matmul_colmajor_scalar(W, pool);
+    }
 
+    // Threads split N, so each owns disjoint output columns: no reduction, no synchronization.
+    Mat matmul_colmajor_scalar(const MMapWeight& W, ThreadPool& pool) const {
+        const std::size_t M = rows_;
+        const std::size_t K = cols_;
+        const std::size_t N = W.out_features();
+        Mat result(M, N);
+        const T* A_ptr = data_.data();
+        T* C_ptr = result.data_.data();
+        const std::size_t worker_count = std::min(pool.size(), N);
         pool.run(worker_count, [&](std::size_t t) {
-            const std::size_t tile_begin = k_tiles * t / worker_count;
-            const std::size_t tile_end = k_tiles * (t + 1) / worker_count;
-            const std::size_t k_begin = tile_begin * TK;
-            const std::size_t k_limit = std::min(tile_end * TK, K);
-            T* partial = t == 0 ? C_ptr : partials.data() + (t - 1) * N;
-
-            for (std::size_t j0 = 0; j0 < N; j0 += TJ) {
-                const std::size_t j_end = std::min(j0 + TJ, N);
-                for (std::size_t k0 = k_begin; k0 < k_limit; k0 += TK) {
-                    const std::size_t k_end = std::min(k0 + TK, k_limit);
-                    micro_kernels::mmap_matmul_tile(A_ptr, B_ptr, partial, K, N,
-                                                    0, 1, j0, j_end, k0, k_end,
-                                                    use_avx2, aligned_b);
+            const std::size_t j_begin = N * t / worker_count;
+            const std::size_t j_end = N * (t + 1) / worker_count;
+            for (std::size_t i = 0; i < M; ++i) {
+                const T* a = A_ptr + i * K;
+                for (std::size_t j = j_begin; j < j_end; ++j) {
+                    const float* w = W.col(j);
+                    T acc{0};
+                    for (std::size_t k = 0; k < K; ++k) {
+                        acc += a[k] * static_cast<T>(w[k]);
+                    }
+                    C_ptr[i * N + j] = acc;
                 }
             }
         });
-
-        for (std::size_t t = 1; t < worker_count; ++t) {
-            const T* partial = partials.data() + (t - 1) * N;
-            for (std::size_t j = 0; j < N; ++j) {
-                C_ptr[j] += partial[j];
-            }
-        }
         return result;
     }
 
-    // A(m, k) * B_mmap(k, n) -> C(m, n)  — same tiling, B is an MMapWeight
-    Mat matmul(const MMapWeight& B, ThreadPool& pool) const {
-        if (cols_ != B.rows()) {
-            throw std::invalid_argument("matmul(MMapWeight): dimension mismatch");
-        }
-        if (rows_ == 1) {
-            return vectmat(B, pool);
-        }
+#if defined(__x86_64__) || defined(__i386__)
+    // Decode, v(1, k) * W(k, n): 1x4 micro-kernel over the whole K (one horizontal sum per
+    // output). Four weight streams per task measured faster than eight on the memory-bound host.
+    // Threads split N in 16-column units (64 B of C) so workers never share a line of the output;
+    // units are claimed dynamically so faster P-cores can take more work than E-cores.
+    Mat matmul_colmajor_decode(const MMapWeight& W, ThreadPool& pool) const {
+        constexpr std::size_t NR = 4;
+        constexpr std::size_t UNIT = 16;
+        const std::size_t K = cols_;
+        const std::size_t N = W.out_features();
+        Mat result(1, N);
+        const float* a = data_.data();
+        float* C_ptr = result.data_.data();
 
+        const std::size_t units = (N + UNIT - 1) / UNIT;
+        pool.run(units, [&](std::size_t t) {
+            const std::size_t j_begin = t * UNIT;
+            const std::size_t j_end = std::min(j_begin + UNIT, N);
+            std::size_t j = j_begin;
+            for (; j + NR <= j_end; j += NR) {
+                micro_kernels::colmajor_decode4_avx2(a, W.col(j), K, C_ptr + j, K);
+            }
+            for (; j < j_end; ++j) {
+                micro_kernels::colmajor_dot_kernel_avx2<1, 1>(a, K, W.col(j), K, C_ptr + j, 0, K);
+            }
+        });
+        return result;
+    }
+
+    // Prefill, A(m, k) * W(k, n). Tiles A[TI, KC] x W[KC, TJ]; for each (I, J) tile the K tiles
+    // run sequentially in the same thread, accumulating into C, then each tile pair is cut into
+    // 2x4 micro-tiles. Threads split M (row blocks), or N when there are too few row blocks to
+    // feed the pool; either way each thread owns disjoint C, so no synchronization.
+    // DECISION: TI = TJ = 64, KC = 512 -> A and W tiles are 128 KB each (L2-resident on a
+    // Raptor Lake P-core), and one horizontal sum per 512 k keeps the reduction cost ~1%.
+    Mat matmul_colmajor_prefill(const MMapWeight& W, ThreadPool& pool) const {
+        constexpr std::size_t TI = 64;
+        constexpr std::size_t TJ = 64;
+        constexpr std::size_t KC = 512;
+        constexpr std::size_t MR = 2;
+        constexpr std::size_t NR = 4;
         const std::size_t M = rows_;
         const std::size_t K = cols_;
-        const std::size_t N = B.cols();
+        const std::size_t N = W.out_features();
+        Mat result(M, N);
+        const float* A_ptr = data_.data();
+        const float* W_ptr = W.data();
+        float* C_ptr = result.data_.data();
+
+        auto micro_tile = [&](std::size_t i, std::size_t mr, std::size_t j, std::size_t nr,
+                              std::size_t k0, std::size_t kc) {
+            const float* a = A_ptr + i * K + k0;
+            const float* w = W_ptr + j * K + k0;
+            float* c = C_ptr + i * N + j;
+            if (mr == MR && nr == NR) {
+                micro_kernels::colmajor_dot_kernel_avx2<MR, NR>(a, K, w, K, c, N, kc);
+            } else if (nr == NR) {
+                micro_kernels::colmajor_dot_kernel_avx2<1, NR>(a, K, w, K, c, N, kc);
+            } else {
+                for (std::size_t r = 0; r < mr; ++r) {
+                    for (std::size_t col = 0; col < nr; ++col) {
+                        micro_kernels::colmajor_dot_kernel_avx2<1, 1>(
+                            a + r * K, K, w + col * K, K, c + r * N + col, N, kc);
+                    }
+                }
+            }
+        };
+
+        auto block = [&](std::size_t i_begin, std::size_t i_end,
+                         std::size_t j_begin, std::size_t j_end) {
+            for (std::size_t i0 = i_begin; i0 < i_end; i0 += TI) {
+                const std::size_t i1 = std::min(i0 + TI, i_end);
+                for (std::size_t j0 = j_begin; j0 < j_end; j0 += TJ) {
+                    const std::size_t j1 = std::min(j0 + TJ, j_end);
+                    for (std::size_t k0 = 0; k0 < K; k0 += KC) {
+                        const std::size_t kc = std::min(KC, K - k0);
+                        for (std::size_t i = i0; i < i1; i += MR) {
+                            for (std::size_t j = j0; j < j1; j += NR) {
+                                micro_tile(i, std::min(MR, i1 - i), j, std::min(NR, j1 - j),
+                                           k0, kc);
+                            }
+                        }
+                    }
+                }
+            }
+        };
+
+        const std::size_t row_blocks = (M + MR - 1) / MR;
+        const std::size_t col_units = (N + 15) / 16;
+        const bool split_columns = row_blocks < pool.size() && col_units > 1;
+        const std::size_t task_count = split_columns ? col_units : row_blocks;
+        const std::size_t worker_count = std::min(pool.size(), task_count);
+        pool.run(worker_count, [&](std::size_t t) {
+            const std::size_t task_begin = task_count * t / worker_count;
+            const std::size_t task_end = task_count * (t + 1) / worker_count;
+            if (split_columns) {
+                block(0, M, task_begin * 16, std::min(task_end * 16, N));
+            } else {
+                block(task_begin * MR, std::min(task_end * MR, M), 0, N);
+            }
+        });
+        return result;
+    }
+#endif
+
+    // Shared AVX2/FMA + cache-tiled path: A(m, k) * B(k, n), B a raw row-major float buffer
+    // (another Mat's storage).
+    Mat matmul_avx_tiled(const float* B_ptr, std::size_t N, ThreadPool& pool) const {
+        const std::size_t M = rows_;
+        const std::size_t K = cols_;
         constexpr std::size_t TI = 64;
         constexpr std::size_t TJ = 64;
         constexpr std::size_t TK = 64;
@@ -262,7 +354,6 @@ public:
             return result;
         }
         const T* A_ptr = data_.data();
-        const float* B_ptr = B.data();
         T* C_ptr = result.data_.data();
 
         bool use_avx2 = false;

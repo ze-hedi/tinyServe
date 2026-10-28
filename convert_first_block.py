@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
-"""Export all BF16 SmolLM3 weights from HF cache as row-major float32 bins.
+"""Export all BF16 SmolLM3 weights from HF cache as float32 bins.
 
-Exports: embedding table, all transformer blocks, final layernorm, and lm_head.
+Every tensor is stored column-major. Linear weights are logical [in, out] (HF [out, in]
+bytes as-is), the embedding is logical [d_model, vocab] (also the tied lm_head), and norm
+vectors are logical [d, 1].
+
+Exports: embedding table (= lm_head), all transformer blocks, final layernorm.
 """
 
 from __future__ import annotations
@@ -30,7 +34,16 @@ TENSORS = (
 )
 
 
-def find_safetensors() -> tuple[list[Path], Path]:
+# Version 2: every tensor is column-major; version 1 was row-major.
+FORMAT_VERSION = 2
+
+
+def linear_logical_shape(source_shape: list[int]) -> list[int]:
+    """HF linear weights are [out, in]; the logical matrix for x @ W is [in, out]."""
+    return [source_shape[1], source_shape[0]]
+
+
+def find_safetensors()-> tuple[list[Path], Path]:
     """Locate the SmolLM3-3B safetensors shards and index in HF cache."""
     model_dir = HF_CACHE / MODEL_REPO
     if not model_dir.is_dir():
@@ -96,13 +109,13 @@ def export_block(shards, keys_by_shard: dict[int, set[str]], layer_idx: int,
         if kind == "vector":
             if tensor.ndim != 1:
                 raise ValueError(f"Expected {source_name} to be a vector, got shape {source_shape}")
-            tensor = tensor.reshape(1, -1)
-            transposed = False
+            shape, layout = [source_shape[0], 1], "column-major"
         else:
             if tensor.ndim != 2:
                 raise ValueError(f"Expected {source_name} to be a matrix, got shape {source_shape}")
-            tensor = tensor.transpose(0, 1)
-            transposed = True
+            # HF [out, in] row-major bytes are exactly the logical [in, out] matrix
+            # in column-major order, so no transpose is needed.
+            shape, layout = linear_logical_shape(source_shape), "column-major"
 
         array = tensor.to(torch.float32).contiguous().numpy()
         array = np.asarray(array, dtype=np.dtype("<f4"), order="C")
@@ -112,19 +125,19 @@ def export_block(shards, keys_by_shard: dict[int, set[str]], layer_idx: int,
         tensors.append({
             "name": output_name,
             "file": filename,
-            "shape": list(array.shape),
+            "shape": shape,
             "dtype": "float32",
             "byte_order": "little-endian",
-            "layout": "row-major",
+            "layout": layout,
             "source_tensor": source_name,
             "source_shape": source_shape,
-            "transposed_from_source": transposed,
+            "transposed_from_source": False,
             "size_bytes": array.nbytes,
         })
 
     manifest = {
         "format": "tinyserve-float32-matrices",
-        "format_version": 1,
+        "format_version": FORMAT_VERSION,
         "source_checkpoint": source,
         "layer_index": layer_idx,
         "tensors": tensors,
@@ -135,7 +148,7 @@ def export_block(shards, keys_by_shard: dict[int, set[str]], layer_idx: int,
 def export_single_tensor(shards, keys_by_shard: dict[int, set[str]],
                          tensor_name: str, output_name: str, kind: str,
                          output_dir: Path, source: str) -> None:
-    """Export a single top-level tensor (embedding, final_norm, lm_head) to output_dir."""
+    """Export a single top-level tensor (embedding, final_norm) to output_dir."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
     tensor = None
@@ -154,18 +167,17 @@ def export_single_tensor(shards, keys_by_shard: dict[int, set[str]],
     if kind == "vector":
         if tensor.ndim != 1:
             raise ValueError(f"Expected {tensor_name} to be a vector, got shape {source_shape}")
-        tensor = tensor.reshape(1, -1)
-        transposed = False
+        shape, layout = [source_shape[0], 1], "column-major"
     elif kind == "matrix":
-        # Keep as-is (e.g. embedding: vocab_size x embed_dim, already row-major friendly)
+        # Embedding [vocab, d] row-major bytes == logical [d, vocab] column-major: token t is
+        # column t. Same orientation as a linear weight, which is why it doubles as lm_head.
         if tensor.ndim != 2:
             raise ValueError(f"Expected {tensor_name} to be a matrix, got shape {source_shape}")
-        transposed = False
-    else:  # "linear" — transpose for row-major x @ W convention
+        shape, layout = linear_logical_shape(source_shape), "column-major"
+    else:  # "linear" — logical [in, out] stored column-major (= HF bytes as-is)
         if tensor.ndim != 2:
             raise ValueError(f"Expected {tensor_name} to be a matrix, got shape {source_shape}")
-        tensor = tensor.transpose(0, 1)
-        transposed = True
+        shape, layout = linear_logical_shape(source_shape), "column-major"
 
     array = tensor.to(torch.float32).contiguous().numpy()
     array = np.asarray(array, dtype=np.dtype("<f4"), order="C")
@@ -175,24 +187,24 @@ def export_single_tensor(shards, keys_by_shard: dict[int, set[str]],
     info = {
         "name": output_name,
         "file": filename,
-        "shape": list(array.shape),
+        "shape": shape,
         "dtype": "float32",
         "byte_order": "little-endian",
-        "layout": "row-major",
+        "layout": layout,
         "source_tensor": tensor_name,
         "source_shape": source_shape,
-        "transposed_from_source": transposed,
+        "transposed_from_source": False,
         "size_bytes": array.nbytes,
     }
 
     # For embedding, add vocab_size and embed_dim for convenience
     if output_name == "embed_tokens":
-        info["vocab_size"] = array.shape[0]
-        info["embed_dim"] = array.shape[1]
+        info["vocab_size"] = source_shape[0]
+        info["embed_dim"] = source_shape[1]
 
     manifest = {
         "format": "tinyserve-float32-matrices",
-        "format_version": 1,
+        "format_version": FORMAT_VERSION,
         "source_checkpoint": source,
         "tensor": info,
     }
@@ -246,15 +258,8 @@ def main() -> None:
     )
     print("  final_norm done")
 
-    # lm_head is tied to embed_tokens (tie_word_embeddings=true).
-    # Export the same weight transposed as lm_head for the output projection:
-    # embed_tokens is (vocab_size, d_model), lm_head needs (d_model, vocab_size).
-    export_single_tensor(
-        opened, keys_by_shard, "model.embed_tokens.weight",
-        "lm_head", "linear",
-        output_root, source,
-    )
-    print("  lm_head done (tied to embed_tokens, transposed)")
+    # lm_head is tied to embed_tokens (tie_word_embeddings=true): the runtime reuses the
+    # column-major embed_tokens mapping, so no separate file is written.
 
     # --- Copy tokenizer files ---
     import shutil
@@ -269,7 +274,7 @@ def main() -> None:
         else:
             print(f"  {fname} not found in snapshot, skipping")
 
-    print(f"Done. Embedding + {num_layers} blocks + final_norm + lm_head + tokenizer written to {output_root}/")
+    print(f"Done. Embedding (= lm_head) + {num_layers} blocks + final_norm + tokenizer written to {output_root}/")
 
 
 if __name__ == "__main__":

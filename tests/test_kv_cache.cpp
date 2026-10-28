@@ -30,9 +30,9 @@ private:
 };
 
 MMapWeight make_weight(const std::filesystem::path& dir, const std::string& name,
-                       std::size_t rows, std::size_t cols, std::mt19937& rng, float stddev) {
+                       std::size_t k, std::size_t n, std::mt19937& rng, float stddev) {
     std::normal_distribution<float> dist(0.0f, stddev);
-    std::vector<float> values(rows * cols);
+    std::vector<float> values(k * n);
     for (auto& v : values) v = dist(rng);
     const std::string file = name + ".bin";
     std::ofstream out(dir / file, std::ios::binary | std::ios::trunc);
@@ -40,8 +40,8 @@ MMapWeight make_weight(const std::filesystem::path& dir, const std::string& name
               static_cast<std::streamsize>(values.size() * sizeof(float)));
     out.close();
     nlohmann::json manifest = {{"tensors", nlohmann::json::array({{
-        {"name", name}, {"dtype", "float32"}, {"layout", "row-major"},
-        {"byte_order", "little-endian"}, {"shape", {rows, cols}},
+        {"name", name}, {"dtype", "float32"}, {"layout", "column-major"},
+        {"byte_order", "little-endian"}, {"shape", {k, n}},
         {"size_bytes", values.size() * sizeof(float)}, {"file", file}}})}};
     MMapWeight weight;
     weight.load(dir, manifest, name);
@@ -70,12 +70,12 @@ void expect_cached_matches_full(bool use_rope, const std::vector<std::size_t>& c
     TempDir dir;
     std::mt19937 rng(7);
     MMapLlamaBlockWeights w;
-    w.input_layernorm = make_weight(dir.path(), "in_ln", 1, kModel, rng, 0.3f);
+    w.input_layernorm = make_weight(dir.path(), "in_ln", kModel, 1, rng, 0.3f);
     w.q_proj = make_weight(dir.path(), "q", kModel, kHeads * kHeadDim, rng, 0.4f);
     w.k_proj = make_weight(dir.path(), "k", kModel, kKvHeads * kHeadDim, rng, 0.4f);
     w.v_proj = make_weight(dir.path(), "v", kModel, kKvHeads * kHeadDim, rng, 0.4f);
     w.o_proj = make_weight(dir.path(), "o", kHeads * kHeadDim, kModel, rng, 0.4f);
-    w.post_attention_layernorm = make_weight(dir.path(), "post_ln", 1, kModel, rng, 0.3f);
+    w.post_attention_layernorm = make_weight(dir.path(), "post_ln", kModel, 1, rng, 0.3f);
     w.gate_proj = make_weight(dir.path(), "gate", kModel, kFf, rng, 0.3f);
     w.up_proj = make_weight(dir.path(), "up", kModel, kFf, rng, 0.3f);
     w.down_proj = make_weight(dir.path(), "down", kFf, kModel, rng, 0.3f);
