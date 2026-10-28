@@ -227,7 +227,7 @@ TINY_SERVE_TOKENIZER_JSON=smollm3/tokenizer/tokenizer.json ./build/tokenizer_tes
 | `bench_chat_prefill` | Rendered chat prompt → first token; inspect prompt, IDs, top logits, and repeated prefill timings |
 | `bench_generate` | Interactive multi-turn generation with cache-reuse and decode timing statistics |
 | `example_chat_context` | Render and tokenize message history without loading model weights |
-| `tokenizer_test` | Standalone tokenizer checks |
+| `tokenizer_test` | Standalone tokenizer throughput benchmark |
 | `tui/tui_chat` | Terminal chat interface |
 
 Examples:
@@ -258,6 +258,8 @@ Examples:
 Both mmap benchmarks accept `--prefault` (`MAP_POPULATE`) and `--hugepages` (`MADV_HUGEPAGE` advice), as well as `--seq`, `--threads`, `--warmup`, `--iters`, and `--check`. Their `--help` prints usage. Passing `smollm3/bloc_0` explicitly avoids the single-block benchmark's legacy default of `bloc_0`.
 
 For first-touch measurements, include mapping/load time as well as the first forward. Warm page-cache results are different from storage-cold results. A one-token block benchmark is also different from end-to-end cached generation. Reference checks allocate owned weight copies and can substantially increase memory use.
+
+**Current validation status:** while preparing this README, the Release build and all six CTest suites passed, as did the tokenizer benchmark and context-inspection example. However, the two `--check` examples above reported `mmap output differs from the non-mmap reference` with the local SmolLM3 export (single block at sequence length 16; one-layer model at sequence length 4). These numerical mismatches remain unresolved; passing unit tests alone does not establish full-model numerical equivalence.
 
 ## Code map
 
